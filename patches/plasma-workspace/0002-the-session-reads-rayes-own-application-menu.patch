@@ -1,0 +1,276 @@
+Subject: the session reads Raye's own application menu, decided in the code
+
+Raye ships nine application categories -- raye-applications.menu and nine
+.directory files -- and a three-line session environment script that
+exported XDG_MENU_PREFIX=raye- so that KSycoca would read them. The
+categories were installed, correct, and never read, on every account, since
+the day they were written.
+
+🚨 Measured on 2026-11-06 against this source:
+
+    startplasma-wayland.cpp:66   runEnvironmentScripts();
+    startplasma-wayland.cpp:72   setupPlasmaEnvironment();
+    startplasma.cpp:410            qputenv("XDG_MENU_PREFIX", "plasma-");
+
+and the same order in startplasma-x11.cpp, at 58 and 62. The environment
+scripts are sourced BEFORE the session's environment is set up, and the line
+above overwrites the variable unconditionally. So the script did its job and
+six lines of control flow later the value was gone.
+
+⚠️ And no other mechanism outside the source could have done it either,
+which is what makes this a patch rather than a configuration change:
+
+  * a profile snippet, PAM's environment or the login manager all set the
+    variable before startplasma even runs, so the same line overwrites them;
+  * systemd's own environment is not a way round it: syncDBusEnvironment()
+    sends this process's environment to the activation environment AFTER
+    setupPlasmaEnvironment() has run, and importSystemdEnvrionment(), which
+    runs after that, skips every name beginning with XDG_ (isSessionVariable).
+    So the value that reaches every program of the session is this one.
+
+This is the third time this tree has paid for the same shape -- a Raye
+setting written somewhere nothing reads -- after the layout reached through
+KPackage's fallback (0001 of this component) and the containment binding
+written under a containment id instead of a type (plasma-desktop/0002). It is
+also the same shape of test failure: theme/shell/menus/tests sets
+XDG_MENU_PREFIX=raye- itself before running, so the categories were checked
+against the prefix Raye wanted and never against the prefix the session has.
+
+The prefix is now chosen where it is set, in a header of two inline
+functions, and the Raye test that comes with it checks the two properties
+that matter: that the value names the file Raye installs, dash included, and
+that it REPLACES an inherited value rather than filling in a missing one. The
+second is the whole point -- a helper that only wrote when the variable was
+empty would hand the desktop whichever outside mechanism spoke last, which is
+the bug with a different cause.
+
+⚠️ What this patch does NOT claim. It makes the menu reachable; it does not
+measure what changes on screen. The Raye Start applet asks Kicker's RootModel
+with flat: true and showAllAppsCategorized: false, so its All apps list is
+A-Z either way and only moves where the two menu files differ in which
+applications they include at all. What plainly changes is every view that
+shows categories -- the menu editor and the application pickers -- and which
+Include/Exclude rules decide where an application lands. Measuring the
+difference between the two menus needs a session, and belongs there.
+
+Reason: this cannot be done outside the source. XDG_MENU_PREFIX is set
+unconditionally inside setupPlasmaEnvironment(), after every out-of-source
+mechanism has already run, and the session's environment is published from
+this process afterwards -- so there is no file, script, look-and-feel package
+or systemd unit that can decide which application menu a Plasma session
+reads. The three-line environment script this replaces is the proof: it is
+installed, it runs, and it does nothing.
+
+--- a/startkde/startplasma.cpp
++++ b/startkde/startplasma.cpp
+@@ -44,6 +44,7 @@
+ #include "debug.h"
+ #include "klookandfeelmanager.h"
+ #include "lookandfeelsettings.h"
++#include "rayemenuprefix.h"
+ 
+ using namespace Qt::StringLiterals;
+ 
+@@ -407,7 +408,15 @@
+ 
+     qputenv("KDE_APPLICATIONS_AS_SCOPE", "1");
+ 
+-    qputenv("XDG_MENU_PREFIX", "plasma-");
++    // Raye's own application categories, and this is the only place that can
++    // choose them. 🚨 The line that stood here overwrote XDG_MENU_PREFIX
++    // unconditionally, and it runs after every mechanism outside the source:
++    // runEnvironmentScripts() is called before this function in both entry
++    // points, systemd's and D-Bus's environments are only read afterwards,
++    // and importSystemdEnvrionment() skips every XDG_ name. So Raye's menu
++    // file was installed, correct and never read, and no script could have
++    // fixed it. See startkde/rayemenuprefix.h.
++    setRayeMenuPrefix();
+ 
+     // Add kdedefaults dir to allow config defaults overriding from a writable location
+     QByteArray currentConfigDirs = qgetenv("XDG_CONFIG_DIRS");
+--- /dev/null
++++ b/startkde/rayemenuprefix.h
+@@ -0,0 +1,42 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QByteArray>
++#include <QtEnvironmentVariables>
++
++/**
++ * The prefix of the XDG application menu a Raye session reads.
++ *
++ * The desktop-menu specification puts the prefix straight in front of the
++ * file name, so the trailing '-' is part of the value and not a separator the
++ * reader adds: "raye-" names menus/raye-applications.menu, which is the file
++ * Raye installs. Spelled without the dash it would name rayeapplications.menu,
++ * KSycoca would find nothing and fall back to another menu without a word --
++ * which is the failure this whole patch is about, arrived at from a typo
++ * instead of from an ordering.
++ */
++inline QByteArray rayeMenuPrefix()
++{
++    return QByteArrayLiteral("raye-");
++}
++
++/**
++ * Puts that prefix in the session's environment.
++ *
++ * 🚨 It REPLACES whatever the session inherited, deliberately, because that is
++ * the behaviour of the line it stands in for. Honouring an inherited value
++ * instead would make which categories the desktop shows depend on whatever a
++ * profile snippet, a login manager or a leftover user script happened to
++ * export -- a desktop quietly showing another one's menu, with nothing to say
++ * so. A deterministic prefix is worth more here than an escape hatch nobody
++ * asked for.
++ */
++inline void setRayeMenuPrefix()
++{
++    qputenv("XDG_MENU_PREFIX", rayeMenuPrefix());
++}
+--- a/startkde/CMakeLists.txt
++++ b/startkde/CMakeLists.txt
+@@ -52,6 +52,14 @@
+ add_subdirectory(session-shortcuts)
+ add_subdirectory(session-restore)
+ 
++# Raye's own tests of the session startup, which the package build runs even
++# though it builds with BUILD_TESTING=OFF. enable_testing() is called by hand
++# at the top level by patches/plasma-workspace/0001, which also makes the
++# packaging configure with RAYE_TESTING=ON and run ctest -R '^raye'.
++if(BUILD_TESTING OR RAYE_TESTING)
++    add_subdirectory(raye-autotests)
++endif()
++
+ #FIXME: reconsider, looks fishy
+ if(NOT CMAKE_INSTALL_PREFIX STREQUAL "/usr")
+     set_property(SOURCE startplasma.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+--- /dev/null
++++ b/startkde/raye-autotests/CMakeLists.txt
+@@ -0,0 +1,22 @@
++# Raye's own test of the session's menu prefix, in a directory of its own
++# rather than in an upstream autotests/: the packaging builds with
++# BUILD_TESTING=OFF and empties dh_auto_test, and a Raye patch still has to be
++# checked where it is built.
++#
++# Qt6::Test is asked for here on purpose: with BUILD_TESTING off nothing else
++# in the tree pulls it in.
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test)
++
++# rayemenuprefix.h is header-only, so the test needs none of startplasma's
++# objects -- and must not have them: setupPlasmaEnvironment() writes in the
++# account's configuration directory, loads a look-and-feel package and talks to
++# D-Bus, none of which a build-time test may do. What the call site does is
++# checked by reading the source instead, in desktop/tests/test_menu_prefix.py.
++add_executable(tst_rayemenuprefix tst_rayemenuprefix.cpp)
++target_include_directories(tst_rayemenuprefix PRIVATE ..)
++target_link_libraries(tst_rayemenuprefix PRIVATE Qt6::Test)
++# the name begins with raye: that is what the package build runs
++add_test(NAME rayemenuprefix COMMAND tst_rayemenuprefix)
++set_tests_properties(rayemenuprefix PROPERTIES
++    TIMEOUT 60
++    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+--- /dev/null
++++ b/startkde/raye-autotests/tst_rayemenuprefix.h
+@@ -0,0 +1,27 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QByteArray>
++#include <QObject>
++
++class RayeMenuPrefixTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void init();
++    void cleanup();
++
++    void namesTheMenuFileRayeInstalls();
++    void putsThePrefixInTheSessionsEnvironment();
++    void replacesWhatTheSessionInherited();
++
++private:
++    QByteArray m_inherited;
++    bool m_wasSet = false;
++};
+--- /dev/null
++++ b/startkde/raye-autotests/tst_rayemenuprefix.cpp
+@@ -0,0 +1,66 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "tst_rayemenuprefix.h"
++#include "rayemenuprefix.h"
++
++#include <QTest>
++
++// No window and no D-Bus: the helper is a value and a qputenv.
++QTEST_GUILESS_MAIN(RayeMenuPrefixTest)
++
++void RayeMenuPrefixTest::init()
++{
++    // The cases set a real environment variable, so each one gets the
++    // environment it expects and gives back the one it was handed: a case
++    // that leaked its value into the next would make the order of the cases
++    // part of the result.
++    m_wasSet = qEnvironmentVariableIsSet("XDG_MENU_PREFIX");
++    m_inherited = qgetenv("XDG_MENU_PREFIX");
++    qunsetenv("XDG_MENU_PREFIX");
++}
++
++void RayeMenuPrefixTest::cleanup()
++{
++    if (m_wasSet) {
++        qputenv("XDG_MENU_PREFIX", m_inherited);
++    } else {
++        qunsetenv("XDG_MENU_PREFIX");
++    }
++}
++
++void RayeMenuPrefixTest::namesTheMenuFileRayeInstalls()
++{
++    // The prefix goes straight in front of the file name, so the dash is part
++    // of the value. Without it the session asks for rayeapplications.menu,
++    // which nothing installs, and falls back in silence.
++    QCOMPARE(rayeMenuPrefix() + "applications.menu", QByteArrayLiteral("raye-applications.menu"));
++}
++
++void RayeMenuPrefixTest::putsThePrefixInTheSessionsEnvironment()
++{
++    QVERIFY(!qEnvironmentVariableIsSet("XDG_MENU_PREFIX"));
++    setRayeMenuPrefix();
++    QCOMPARE(qgetenv("XDG_MENU_PREFIX"), rayeMenuPrefix());
++}
++
++void RayeMenuPrefixTest::replacesWhatTheSessionInherited()
++{
++    // 🚨 The property the patch exists for. Everything outside the source --
++    // a session environment script, a profile snippet, the login manager,
++    // systemd's own environment -- has already run by the time
++    // setupPlasmaEnvironment() is reached, and a helper that only filled the
++    // variable in when it was empty would hand the desktop whichever of them
++    // spoke last. It takes the variable, every time.
++    qputenv("XDG_MENU_PREFIX", QByteArrayLiteral("plasma-"));
++    setRayeMenuPrefix();
++    QCOMPARE(qgetenv("XDG_MENU_PREFIX"), rayeMenuPrefix());
++
++    // and not only over Plasma's own value
++    qputenv("XDG_MENU_PREFIX", QByteArrayLiteral("gnome-"));
++    setRayeMenuPrefix();
++    QCOMPARE(qgetenv("XDG_MENU_PREFIX"), rayeMenuPrefix());
++}

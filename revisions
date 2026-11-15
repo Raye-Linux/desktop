@@ -1,0 +1,11 @@
+# One line per Raye revision of the desktop packages: the number build.sh
+# writes after +raye, and the sha256 of the whole patch series it was built
+# from (tests/test_revision.py says how it is taken). A changed patch needs
+# a new line and a new raye_revision, or the update reaches no machine.
+#
+# +raye1 was built from several series between 2026-11-04 and 2026-11-07
+# and none was recorded: 1 stands for all of them.
+1 -
+2 8ea5c1e8d97774872f17467b27ef78ca549bf07cec6c10d70fb47b7441c29aa7
+3 d5e9fbb5af8d08a8d956e6ab50a08d7bcb49a5d3ef5e9c3f5f0d45b1a896c019
+4 f453e0c9f1a763c94ea7f9d9600ebb9c7fe6e3323819dfe1074e18eb76138e48

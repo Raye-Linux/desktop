@@ -1,0 +1,485 @@
+Subject: the default layout belongs to the desktop, not to a look
+
+The desktop a new account starts with -- icons on the desktop, the bar at
+the bottom with Start, the open apps, the tray and the clock -- is built
+by a script. libplasma looks for it in two places, in this order: the
+active look-and-feel package's layouts/<shell>-layout.js, then this shell
+package's contents/layout.js, which its Plasma/Shell structure maps to
+the key `defaultlayout`.
+
+Raye's was in the look-and-feel package. So the shape of the desktop was
+part of the theme: it travelled with the colours, and a look that carries
+no layout script -- or any look but Raye's -- handed the account somebody
+else's desktop. It is now this package's own, where it belongs: changing
+the colour scheme, or Night for Day, leaves the layout alone.
+
+The layout script's own test comes with it, in the Raye test directory
+patch 0001 set up, against a stand-in of the scripting API: that it runs,
+that the taskbar is built and keeps its widgets, that an account without
+the Raye applets still gets a usable bar rather than none, and that no
+containment action is written under a containment id.
+
+⚠️ The Raye look-and-feel package must stop shipping layouts/ in the same
+release, because it is read first; and it may not stop shipping it before
+this package is installed, or a new account would be handed no layout at
+all and start without a taskbar. The image build refuses that combination
+rather than make such an image (raye/iso, DESKTOP_DEBS).
+
+🚨 And until now that was the *only* thing refusing it, at image build and
+nowhere else: `apt install raye-theme` onto an upstream plasma-desktop gave
+a first login with no taskbar at all, because the Raye look ships no
+layouts/ any more and upstream's shell package has never had this
+layout.js. So the package that ships it now declares
+`Provides: raye-desktop-layout`, and raye-theme depends on that name.
+
+⚠️ The name is a virtual package and not `Depends: plasma-desktop-data`,
+because Ubuntu's own build of plasma-desktop-data satisfies that package
+name and carries no Raye layout: the dependency would go green against
+precisely the package it exists to exclude. Nor can it be versioned around
+-- the version here is <ubuntu>+raye<n>, which no Depends can name. And the
+Provides is deliberately unversioned: the property wanted is "a Raye layout
+is installed", and pinning +raye<n> would break the dependency on every
+Ubuntu desktop update until everything naming it is rebuilt too.
+
+⚠️ What it does on an Ubuntu desktop update is the point, and worth stating
+plainly rather than overselling: when apt takes Ubuntu's newer
+plasma-desktop-data, the virtual package goes with it, so raye-theme's
+dependency can no longer be met. apt then either holds the update back or
+offers to remove raye-theme -- it has to *say* something, where today the
+replacement is silent. Removing raye-theme is not the taskbar-less state:
+without /etc/xdg/kdeglobals the active look is Breeze again, and Breeze's
+own layout applies. The state this forbids is the other one, raye-theme
+kept on a desktop package that has no layout.
+
+🚨 Measured, and it decides which package carries the Provides:
+debian/plasma-desktop-data.install is the only one here taking
+usr/share/plasma, and plasma_install_package(desktoppackage ... shells)
+installs under it. Breeze's layouts/, the one that was being read instead,
+belongs to plasma-workspace-data -- a different source package, which is
+why the lookup itself is corrected in patches/plasma-workspace/0001.
+
+Reason: the property wanted here cannot be had outside the source. A
+layout in a look-and-feel package is, by construction, part of a look;
+the only file libplasma reads for a layout that belongs to the desktop
+itself is this package's contents/layout.js, and this package owns that
+path -- shipping a second copy of it from another package is a file
+conflict, not a configuration. The same holds for its test, which has to
+run where the script is built.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -296,6 +296,10 @@
+ 
+ plasma_install_package(desktoppackage org.kde.plasma.desktop shells shell)
+ 
++if(BUILD_TESTING OR RAYE_TESTING)
++    add_subdirectory(desktoppackage/autotests)
++endif()
++
+ if (INSTALL_SDDM_THEME)
+     configure_file(sddm-theme/theme.conf.cmake ${CMAKE_CURRENT_BINARY_DIR}/sddm-theme/theme.conf)
+ 
+--- a/debian/control
++++ b/debian/control
+@@ -197,6 +197,12 @@
+ Package: plasma-desktop-data
+ Architecture: all
+ Depends: python3:any, ${misc:Depends},
++# raye-desktop-layout: this package ships the Raye default layout, as the shell
++# package's contents/layout.js. Depend on this name and never on
++# plasma-desktop-data: Ubuntu's own build satisfies that package name and
++# carries no Raye layout. Unversioned on purpose -- see
++# patches/plasma-desktop/0003 in the raye/desktop series.
++Provides: raye-desktop-layout,
+ Breaks: plasma-widgets-addons (<< 4:5.25.70~),
+ Replaces: plasma-widgets-addons (<< 4:5.25.70~),
+ Description: Tools and widgets for the desktop data files
+--- /dev/null
++++ b/desktoppackage/contents/layout.js
+@@ -0,0 +1,103 @@
++// The desktop a new Raye account starts with: icons on the desktop, one
++// bar at the bottom with the Start button and the open apps in the middle,
++// the tray and the clock on the right. The other screens get their taskbar
++// from raye-taskbar-sync (raye-shell), started by KWin at login.
++//
++// This is the shell package's `defaultlayout` -- libplasma's Plasma/Shell
++// structure maps that key to contents/layout.js. It belongs to the desktop,
++// not to a look: switching between Raye Night and Raye Day, or to any other
++// colour scheme, leaves the layout alone. It used to live in the Raye
++// look-and-feel package, where it was read first and made the layout part
++// of the theme.
++//
++// It runs once, for an account that has no containments yet. A change that
++// existing accounts must also get goes in contents/updates/, which Plasma
++// runs once per account and records in kdeglobals [Updates] performed.
++
++var wallpaper = "file:///usr/share/wallpapers/Raye/";
++
++var all = desktops();
++for (var i = 0; i < all.length; ++i) {
++    var d = all[i];
++    d.wallpaperPlugin = "org.kde.image";
++    d.currentConfigGroup = ["Wallpaper", "org.kde.image", "General"];
++    d.writeConfig("Image", wallpaper);
++}
++
++// Right-click on the bar: Raye's short menu (Task Manager, Taskbar
++// settings) instead of Plasma's. Plasma reads it when a panel is made, so
++// it is written first. The menu comes with raye-shell, as sync.js does.
++if (fileExists("/usr/share/raye/taskbar/sync.js")) {
++    var actions = ConfigFile(ConfigFile("plasma-org.kde.plasma.desktop-appletsrc", "ActionPlugins"), "1");
++    actions.writeEntry("RightButton;NoModifier", "org.raye.desktopmenu");
++    // not a mouse button: it loads org.raye.taskbarpins with every panel,
++    // which keeps one list of pinned apps for all taskbars
++    actions.writeEntry("raye-taskbar-pins", "org.raye.taskbarpins");
++}
++
++var panel = new Panel;
++// Plasma puts a new panel on the screen with the pointer; the taskbar
++// with the clock and the tray goes on the main display
++panel.screen = 0;
++panel.location = "bottom";
++panel.height = 48;            // same height as the bar people know
++panel.hiding = "none";
++panel.floating = false;
++
++// Raye's own taskbar when raye-shell brings it: Start with search and
++// task view, the apps, the tray, the clock with the far corner. Its
++// settings (pins, alignment, search style...) live in rayeshellrc.
++var raye = knownWidgetTypes.indexOf("org.raye.start") >= 0
++        && knownWidgetTypes.indexOf("org.raye.taskbar") >= 0
++        && knownWidgetTypes.indexOf("org.raye.clock") >= 0;
++
++if (raye) {
++    panel.addWidget("org.raye.start");
++    panel.addWidget("org.raye.taskbar");
++    // the tray is tidied at first login by raye-tray-defaults, once Plasma
++    // has built it; raye-taskbar-sync takes its notifications item out
++    // (the clock shows the notifications)
++    panel.addWidget("org.kde.plasma.systemtray");
++    panel.addWidget("org.raye.clock");
++} else {
++    // the two spacers keep Start and the tasks centred
++    panel.addWidget("org.kde.plasma.panelspacer");
++
++    var start = panel.addWidget("org.kde.plasma.kickoff");
++    start.currentConfigGroup = ["General"];
++    start.writeConfig("icon", "raye-eye");
++    start.writeConfig("favoritesPortedToKAstats", "true");
++    // like the Start menu people know: pinned apps as a grid, all apps as a
++    // list, power buttons with their names
++    start.writeConfig("favoritesDisplay", "0");
++    start.writeConfig("applicationsDisplay", "1");
++    start.writeConfig("showActionButtonCaptions", "true");
++    start.writeConfig("primaryActions", "1");
++
++    var tasks = panel.addWidget("org.kde.plasma.icontasks");
++    tasks.currentConfigGroup = ["General"];
++    // Firefox itself rather than "the default browser": when Firefox makes
++    // itself the default it registers an entry with no icon, and the pin
++    // would turn into a blank page with a second Firefox button next to it
++    tasks.writeConfig("launchers", [
++        "applications:org.kde.dolphin.desktop",
++        applicationExists("firefox.desktop") ? "applications:firefox.desktop" : "preferred://browser",
++        "applications:org.raye.store.desktop",
++        "applications:org.raye.settings.desktop"
++    ].join(","));
++    tasks.writeConfig("iconSpacing", "1");   // 1 is the tightest, like the bar people know
++    tasks.writeConfig("maxStripes", "1");
++    tasks.writeConfig("showToolTips", "true");
++
++    panel.addWidget("org.kde.plasma.panelspacer");
++    // the tray is tidied at first login by raye-tray-defaults, once Plasma
++    // has built it
++    panel.addWidget("org.kde.plasma.systemtray");
++
++    var clock = panel.addWidget("org.kde.plasma.digitalclock");
++    clock.currentConfigGroup = ["Appearance"];
++    clock.writeConfig("showDate", "true");
++    clock.writeConfig("dateFormat", "shortDate");
++
++    panel.addWidget("org.kde.plasma.showdesktop");
++}
+--- /dev/null
++++ b/desktoppackage/autotests/CMakeLists.txt
+@@ -0,0 +1,19 @@
++# The shell package's default layout is a script, and it is what every new
++# account runs. Running it against a stand-in of the scripting API is the
++# only way to test it without a session, and it runs in the package build.
++
++# Asked for here on purpose: the packaging configures with BUILD_TESTING=OFF,
++# so nothing else in the tree pulls Qt6::Test in and the targets below would
++# have nothing to link against.
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test Qml)
++
++add_executable(tst_rayelayout tst_rayelayout.cpp)
++target_link_libraries(tst_rayelayout PRIVATE Qt6::Test Qt6::Qml)
++target_compile_definitions(tst_rayelayout PRIVATE
++    RAYE_LAYOUT_MOCK="${CMAKE_CURRENT_SOURCE_DIR}/layout-mock.js"
++    RAYE_LAYOUT_JS="${CMAKE_CURRENT_SOURCE_DIR}/../contents/layout.js")
++add_test(NAME rayelayout COMMAND tst_rayelayout)
++set_tests_properties(rayelayout PROPERTIES
++    TIMEOUT 60
++    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
++
+--- /dev/null
++++ b/desktoppackage/autotests/layout-mock.js
+@@ -0,0 +1,116 @@
++// A stand-in for the Plasma desktop scripting API, as much of it as the
++// shell package's default layout uses. Values come back as strings, the way
++// KConfig hands them back, and ConfigFile keeps real groups so what the
++// script wrote can be read back after it has run.
++
++var __files = {};        // file -> group path -> key -> value
++var __present = {};      // what fileExists() finds
++var __printed = [];
++var __nextId = 1;
++var __panels = [];
++var __desktops = [];
++var screenCount = 1;
++var knownWidgetTypes = ["org.kde.plasma.kickoff", "org.kde.plasma.icontasks",
++                        "org.kde.plasma.systemtray", "org.kde.plasma.digitalclock",
++                        "org.kde.plasma.panelspacer", "org.kde.plasma.showdesktop",
++                        "org.raye.start", "org.raye.taskbar", "org.raye.clock"];
++
++function print(text) { __printed.push(String(text)); }
++function fileExists(path) { return __present[path] === true; }
++function applicationExists(name) { return name === "firefox.desktop"; }
++function defaultApplication(name) { return "firefox.desktop"; }
++
++// ConfigFile(file, group) and ConfigFile(parent, subgroup), as Plasma's own
++// update scripts use them
++function ConfigFile(a, b) {
++    var file, path;
++    if (typeof a === "string") {
++        file = a;
++        path = [b];
++    } else {
++        file = a.__file;
++        path = a.__path.concat([b]);
++    }
++    if (!__files[file])
++        __files[file] = {};
++    var key = path.join("\u0000");
++    if (!__files[file][key])
++        __files[file][key] = {};
++    var store = __files[file][key];
++    return {
++        __file: file,
++        __path: path,
++        // every group one level under this one, as KConfig lists them
++        get groupList() {
++            var out = [];
++            var mine = path.join("\u0000") + "\u0000";
++            for (var g in __files[file]) {
++                if (g.indexOf(mine) === 0) {
++                    var rest = g.substring(mine.length);
++                    if (rest.indexOf("\u0000") === -1 && out.indexOf(rest) === -1)
++                        out.push(rest);
++                }
++            }
++            return out;
++        },
++        readEntry: function (k, def) { return k in store ? store[k] : def; },
++        writeEntry: function (k, v) { store[k] = String(v); },
++        deleteEntry: function (k) { delete store[k]; },
++        get keyList() { return Object.keys(store); }
++    };
++}
++
++function __widget(plugin) {
++    return {
++        id: __nextId++,
++        plugin: plugin,
++        type: plugin,
++        cfg: {},
++        currentConfigGroup: [],
++        readConfig: function (k, def) {
++            var g = this.cfg[this.currentConfigGroup.join("/")] || {};
++            return k in g ? g[k] : def;
++        },
++        writeConfig: function (k, v) {
++            var p = this.currentConfigGroup.join("/");
++            if (!this.cfg[p])
++                this.cfg[p] = {};
++            this.cfg[p][k] = String(v);
++        }
++    };
++}
++
++function Panel() {
++    var p = __widget("org.kde.panel");
++    p.widgets = [];
++    p.addWidget = function (plugin) {
++        var w = __widget(plugin);
++        this.widgets.push(w);
++        return w;
++    };
++    __panels.push(p);
++    return p;
++}
++
++function desktops() { return __desktops; }
++
++// the scene sets this up: one Folder view desktop per screen, with the
++// containment groups Plasma would already have written
++function __scene(plugins) {
++    __desktops = [];
++    for (var i = 0; i < plugins.length; ++i) {
++        var d = __widget(plugins[i]);
++        __desktops.push(d);
++        ConfigFile(ConfigFile("plasma-org.kde.plasma.desktop-appletsrc", "Containments"),
++                   String(d.id)).writeEntry("plugin", plugins[i]);
++    }
++}
++
++// what the layout left in [ActionPlugins][group] for a trigger. The group
++// is a containment TYPE for anything libplasma reads -- 0 desktop, 1 panel
++// -- so passing a containment id here is how a test asks whether the
++// layout wrote somewhere nothing reads.
++function __action(group, trigger) {
++    return ConfigFile(ConfigFile("plasma-org.kde.plasma.desktop-appletsrc", "ActionPlugins"),
++                      String(group)).readEntry(trigger, "");
++}
+--- /dev/null
++++ b/desktoppackage/autotests/tst_rayelayout.cpp
+@@ -0,0 +1,139 @@
++/*
++    The shell package's default layout (contents/layout.js) against a
++    stand-in of Plasma's desktop scripting API: that it runs, what it puts
++    on the taskbar, what it does when the Raye shell is not installed, and
++    that it binds no containment action by containment id.
++
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include <QFile>
++#include <QJSEngine>
++#include <QTest>
++
++using namespace Qt::StringLiterals;
++
++class RayeLayoutTest : public QObject
++{
++    Q_OBJECT
++
++private:
++    static QString read(const QString &path)
++    {
++        QFile f(path);
++        if (!f.open(QIODevice::ReadOnly)) {
++            qFatal("cannot read %s", qPrintable(path));
++        }
++        return QString::fromUtf8(f.readAll());
++    }
++
++    // the mock, then the scene, then the layout; returns the value of `check`
++    static QString run(const QString &scene, const QString &check)
++    {
++        QJSEngine engine;
++        const QString mockPath = QStringLiteral(RAYE_LAYOUT_MOCK);
++        const QString layoutPath = QStringLiteral(RAYE_LAYOUT_JS);
++        QJSValue r = engine.evaluate(read(mockPath), mockPath);
++        if (r.isError()) {
++            return u"mock: "_s + r.toString();
++        }
++        r = engine.evaluate(scene);
++        if (r.isError()) {
++            return u"scene: "_s + r.toString();
++        }
++        r = engine.evaluate(read(layoutPath), layoutPath);
++        if (r.isError()) {
++            return u"layout: "_s + r.toString() + u" line "_s + r.property(u"lineNumber"_s).toString();
++        }
++        r = engine.evaluate(check);
++        if (r.isError()) {
++            return u"check: "_s + r.toString();
++        }
++        return r.toString();
++    }
++
++    // one Folder view desktop, the Raye shell installed
++    static QString withTheShell()
++    {
++        return u"__scene(['org.kde.plasma.folder']);"
++               "__present['/usr/share/raye/taskbar/sync.js'] = true;"_s;
++    }
++
++    // the same, with none of the Raye applets available to the shell
++    static QString withoutTheRayeApplets()
++    {
++        return u"__scene(['org.kde.plasma.folder']);"
++               "knownWidgetTypes = ['org.kde.plasma.kickoff', 'org.kde.plasma.icontasks',"
++               "    'org.kde.plasma.systemtray', 'org.kde.plasma.digitalclock',"
++               "    'org.kde.plasma.panelspacer', 'org.kde.plasma.showdesktop'];"_s;
++    }
++
++private Q_SLOTS:
++    void theLayoutRuns()
++    {
++        QCOMPARE(run(withTheShell(), u"__panels.length"_s), u"1"_s);
++    }
++
++    void theTaskbarSitsAtTheBottomOfTheFirstScreen()
++    {
++        QCOMPARE(run(withTheShell(), u"__panels[0].location"_s), u"bottom"_s);
++        QCOMPARE(run(withTheShell(), u"String(__panels[0].screen)"_s), u"0"_s);
++    }
++
++    void theTaskbarKeepsItsWidgets()
++    {
++        const QString widgets = run(withTheShell(), u"__panels[0].widgets.map(function (w) { return w.plugin; }).join(',')"_s);
++        QCOMPARE(widgets, u"org.raye.start,org.raye.taskbar,org.kde.plasma.systemtray,org.raye.clock"_s);
++    }
++
++    void aDesktopWithoutTheRayeAppletsStillGetsAUsableTaskbar()
++    {
++        // the fall-back branch: Plasma's own widgets, arranged like the bar
++        // people know. A desktop with no taskbar at all is the one outcome
++        // this script may never produce.
++        const QString widgets = run(withoutTheRayeApplets(), u"__panels[0].widgets.map(function (w) { return w.plugin; }).join(',')"_s);
++        QVERIFY2(widgets.contains(u"kickoff"_s), qPrintable(widgets));
++        QVERIFY2(widgets.contains(u"icontasks"_s), qPrintable(widgets));
++        QVERIFY2(widgets.contains(u"digitalclock"_s), qPrintable(widgets));
++    }
++
++    void theDesktopGetsTheRayeWallpaper()
++    {
++        QCOMPARE(run(withTheShell(), u"__desktops[0].wallpaperPlugin"_s), u"org.kde.image"_s);
++        QCOMPARE(run(withTheShell(), u"__desktops[0].cfg['Wallpaper/org.kde.image/General']['Image']"_s),
++                 u"file:///usr/share/wallpapers/Raye/"_s);
++    }
++
++    void theTaskbarMenuIsRayesWhenTheShellIsInstalled()
++    {
++        // [ActionPlugins][1]: 1 is Plasma::Containment::Type::Panel. The
++        // group is keyed by the containment TYPE, never by a containment id.
++        QCOMPARE(run(withTheShell(), u"__action('1', 'RightButton;NoModifier')"_s), u"org.raye.desktopmenu"_s);
++        QCOMPARE(run(withTheShell(), u"__action('1', 'raye-taskbar-pins')"_s), u"org.raye.taskbarpins"_s);
++    }
++
++    void withoutTheRayeShellTheTaskbarKeepsPlasmasMenu()
++    {
++        // no guard file: the layout must not point the menu at a plugin that
++        // is not there, which would leave the taskbar with no menu at all
++        QCOMPARE(run(u"__scene(['org.kde.plasma.folder']);"_s, u"__action('1', 'RightButton;NoModifier')"_s), QString());
++    }
++
++    void theLayoutBindsNoActionByContainmentId()
++    {
++        // A group keyed by an id is read by nothing. And a group keyed by a
++        // TYPE that holds a single key makes libplasma skip the whole
++        // defaults block of the shell package, which would cost the desktop
++        // its right-click menu and its middle-click paste.
++        const QString scene = u"__scene(['org.kde.plasma.folder', 'org.kde.desktopcontainment']);"
++                              "__present['/usr/share/raye/taskbar/sync.js'] = true;"_s;
++        QCOMPARE(run(scene, u"__action(String(__desktops[0].id), 'wheel:Vertical;ControlModifier')"_s), QString());
++        QCOMPARE(run(scene, u"__action(String(__desktops[1].id), 'wheel:Vertical;ControlModifier')"_s), QString());
++        QCOMPARE(run(scene, u"__action(String(__panels[0].id), 'RightButton;NoModifier')"_s), QString());
++    }
++};
++
++QTEST_MAIN(RayeLayoutTest)
++#include "tst_rayelayout.moc"

@@ -1,0 +1,210 @@
+Subject: an older account gets the Raye taskbar menu, once
+
+The taskbar's right-click menu is Raye's short one, and every panel loads
+the shared list of pinned apps. A new account gets both from this
+package's default layout, which only ever runs for an account that has no
+containments yet. The accounts made before it were reached by a script
+run from Plasma's start-up, at every login, forever.
+
+Plasma has the mechanism for exactly this: a script in
+contents/updates/*.js, which it runs once per account and records in
+kdeglobals [Updates] performed. KDE ships seventeen of its own there.
+This is the first of Raye's, and it retires the login script.
+
+⚠️ Two things are written down in the script because they are not
+obvious. Writing the group creates it if it is absent, and once it exists
+libplasma stops reading this package's [Panel][ContainmentActions]
+defaults altogether -- which costs nothing here, since a panel's only
+default is the right-click menu and this sets it, but would not be safe
+for the desktop. And it takes effect at the account's next session: update
+scripts run after the containments have read their actions. It happens
+once.
+
+The script keeps a menu the person chose themselves: only an empty
+setting or Plasma's own default is replaced. There is no second chance to
+undo a wrong overwrite, so that case has its own test.
+
+Reason: a login script cannot be made to run once -- it has no memory of
+its own, which is why the one it replaces kept a marker file in the
+account's state directory and still re-checked the pins at every login.
+The register of what an account has already had done to it is Plasma's,
+read and written by the shell from this package's updates directory, and
+nothing outside the source can put a script there: the path belongs to
+plasma-desktop, so a second copy of it is a file conflict.
+
+--- a/desktoppackage/autotests/CMakeLists.txt
++++ b/desktoppackage/autotests/CMakeLists.txt
+@@ -17,3 +17,14 @@
+     TIMEOUT 60
+     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+ 
++# the Raye update scripts: Plasma runs each once per account, so a mistake
++# in one is not something the next login repairs
++add_executable(tst_rayeupdates tst_rayeupdates.cpp)
++target_link_libraries(tst_rayeupdates PRIVATE Qt6::Test Qt6::Qml)
++target_compile_definitions(tst_rayeupdates PRIVATE
++    RAYE_LAYOUT_MOCK="${CMAKE_CURRENT_SOURCE_DIR}/layout-mock.js"
++    RAYE_UPDATE_TASKBAR_MENU="${CMAKE_CURRENT_SOURCE_DIR}/../contents/updates/raye_taskbar_menu.js")
++add_test(NAME rayeupdates COMMAND tst_rayeupdates)
++set_tests_properties(rayeupdates PROPERTIES
++    TIMEOUT 60
++    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+--- /dev/null
++++ b/desktoppackage/contents/updates/raye_taskbar_menu.js
+@@ -0,0 +1,36 @@
++// The taskbar's right-click menu is Raye's short one (Task Manager,
++// Taskbar settings), and every panel loads the shared list of pinned apps.
++// A new account gets both from this package's default layout; this reaches
++// the accounts made before it.
++//
++// Plasma runs a script in contents/updates once per account and records it
++// in kdeglobals [Updates] performed, so this is not a login script that
++// goes round checking forever.
++//
++// 1 is Plasma::Containment::Type::Panel. The group is keyed by the
++// containment TYPE, never by a containment id.
++//
++// ⚠️ Writing here creates [ActionPlugins][1] if it is absent, and once that
++// group exists libplasma stops reading the [Panel][ContainmentActions]
++// defaults of this package altogether. That costs nothing *here*, because
++// the only default for a panel is the right-click menu and this script
++// sets it. It would not be safe for the desktop, which has more.
++//
++// ⚠️ It takes effect at the account's next session: update scripts run
++// after the containments have already read their actions. It happens once.
++
++if (fileExists("/usr/share/raye/taskbar/sync.js")) {
++    var panelActions = ConfigFile(ConfigFile("plasma-org.kde.plasma.desktop-appletsrc", "ActionPlugins"), "1");
++
++    // an account that picked another menu keeps it
++    var menu = panelActions.readEntry("RightButton;NoModifier", "");
++    if (menu === "" || menu === "org.kde.contextmenu") {
++        panelActions.writeEntry("RightButton;NoModifier", "org.raye.desktopmenu");
++    }
++
++    // not a mouse button: it loads org.raye.taskbarpins with every panel,
++    // which keeps one list of pinned apps for all the taskbars
++    if (panelActions.readEntry("raye-taskbar-pins", "") !== "org.raye.taskbarpins") {
++        panelActions.writeEntry("raye-taskbar-pins", "org.raye.taskbarpins");
++    }
++}
+--- /dev/null
++++ b/desktoppackage/autotests/tst_rayeupdates.cpp
+@@ -0,0 +1,117 @@
++/*
++    The shell package's Raye update scripts against a stand-in of Plasma's
++    desktop scripting API. Plasma runs each of these once per account, so a
++    mistake in one is not something the next login repairs.
++
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include <QFile>
++#include <QJSEngine>
++#include <QTest>
++
++using namespace Qt::StringLiterals;
++
++class RayeUpdatesTest : public QObject
++{
++    Q_OBJECT
++
++private:
++    static QString read(const QString &path)
++    {
++        QFile f(path);
++        if (!f.open(QIODevice::ReadOnly)) {
++            qFatal("cannot read %s", qPrintable(path));
++        }
++        return QString::fromUtf8(f.readAll());
++    }
++
++    static QString run(const QString &script, const QString &scene, const QString &check)
++    {
++        QJSEngine engine;
++        const QString mockPath = QStringLiteral(RAYE_LAYOUT_MOCK);
++        QJSValue r = engine.evaluate(read(mockPath), mockPath);
++        if (r.isError()) {
++            return u"mock: "_s + r.toString();
++        }
++        r = engine.evaluate(scene);
++        if (r.isError()) {
++            return u"scene: "_s + r.toString();
++        }
++        r = engine.evaluate(read(script), script);
++        if (r.isError()) {
++            return u"script: "_s + r.toString() + u" line "_s + r.property(u"lineNumber"_s).toString();
++        }
++        r = engine.evaluate(check);
++        if (r.isError()) {
++            return u"check: "_s + r.toString();
++        }
++        return r.toString();
++    }
++
++    static QString taskbarMenu()
++    {
++        return QStringLiteral(RAYE_UPDATE_TASKBAR_MENU);
++    }
++
++    static QString shellInstalled()
++    {
++        return u"__present['/usr/share/raye/taskbar/sync.js'] = true;"_s;
++    }
++
++private Q_SLOTS:
++    void anOlderAccountGetsTheRayeTaskbarMenu()
++    {
++        QCOMPARE(run(taskbarMenu(), shellInstalled(), u"__action('1', 'RightButton;NoModifier')"_s), u"org.raye.desktopmenu"_s);
++    }
++
++    void anOlderAccountGetsTheSharedPinnedApps()
++    {
++        QCOMPARE(run(taskbarMenu(), shellInstalled(), u"__action('1', 'raye-taskbar-pins')"_s), u"org.raye.taskbarpins"_s);
++    }
++
++    void anAccountThatReplacedPlasmasMenuIsLeftAlone()
++    {
++        // only an empty setting or Plasma's own default is replaced: a person
++        // who chose something else keeps it, and this runs once, so there is
++        // no second chance to undo a wrong overwrite
++        const QString scene = shellInstalled()
++            + u"ConfigFile(ConfigFile('plasma-org.kde.plasma.desktop-appletsrc', 'ActionPlugins'), '1')"
++              ".writeEntry('RightButton;NoModifier', 'org.kde.contextmenu.custom');"_s;
++        QCOMPARE(run(taskbarMenu(), scene, u"__action('1', 'RightButton;NoModifier')"_s), u"org.kde.contextmenu.custom"_s);
++    }
++
++    void plasmasOwnDefaultIsReplaced()
++    {
++        const QString scene = shellInstalled()
++            + u"ConfigFile(ConfigFile('plasma-org.kde.plasma.desktop-appletsrc', 'ActionPlugins'), '1')"
++              ".writeEntry('RightButton;NoModifier', 'org.kde.contextmenu');"_s;
++        QCOMPARE(run(taskbarMenu(), scene, u"__action('1', 'RightButton;NoModifier')"_s), u"org.raye.desktopmenu"_s);
++    }
++
++    void withoutTheRayeShellNothingIsWritten()
++    {
++        // pointing the menu at a plugin that is not installed would leave the
++        // taskbar with no menu at all, and nothing would run again to fix it
++        QCOMPARE(run(taskbarMenu(), QString(), u"__action('1', 'RightButton;NoModifier')"_s), QString());
++        QCOMPARE(run(taskbarMenu(), QString(), u"__action('1', 'raye-taskbar-pins')"_s), QString());
++    }
++
++    void nothingIsWrittenUnderAContainmentId()
++    {
++        // 🚨 The containment id has to be pushed past 1 for this to mean
++        // anything: a desktop containment whose id happens to be 1 writes
++        // into the very group the Panel TYPE uses, so the two are
++        // indistinguishable from the outside. That is most of the reason the
++        // old per-account binding looked like it worked.
++        const QString scene = shellInstalled() + u"__nextId = 34; __scene(['org.kde.plasma.folder']);"_s;
++        QCOMPARE(run(taskbarMenu(), scene, u"String(__desktops[0].id)"_s), u"34"_s);
++        QCOMPARE(run(taskbarMenu(), scene, u"__action('34', 'RightButton;NoModifier')"_s), QString());
++        QCOMPARE(run(taskbarMenu(), scene, u"__action('34', 'raye-taskbar-pins')"_s), QString());
++    }
++};
++
++QTEST_MAIN(RayeUpdatesTest)
++#include "tst_rayeupdates.moc"

@@ -1,0 +1,43 @@
+Subject: the desktop binds Ctrl + wheel to the Raye desktop menu by default
+
+Ctrl + wheel on the desktop resizes the icons, the way it does on
+Windows. The action is a containment action, and libplasma reads a
+desktop's bindings from this shell package's `defaults`, section
+[Desktop][ContainmentActions] -- the same place the right click menu and
+the middle click paste are declared. Raye's binding joins them.
+
+So every account gets it from the shell package: a new one and one made
+a year ago alike, with nothing written into anybody's configuration and
+no script going round to fix accounts afterwards.
+
+🚨 It replaces a per-account write that was wrong. Raye wrote the key
+into [ActionPlugins][<containment id>], but libplasma reads
+[ActionPlugins][<containment TYPE>] -- `QString::number((int)
+containmentType())`, where Desktop is 0 and Panel is 1, and the
+settings module writes it the same way. A desktop containment's id is
+rarely 0, so the binding was written where nothing reads it and
+Ctrl + wheel did nothing at all.
+
+⚠️ And correcting that id to 0 would have been worse than the bug: a
+[ActionPlugins][0] group holding only this one key makes libplasma skip
+the whole defaults block, so the desktop would have lost its right
+click menu and its middle click paste. A default read from the package
+has no such edge.
+
+Reason: this cannot be done outside the source. `defaults` is a file of
+this shell package, owned by plasma-desktop; shipping a second copy of
+it from another package is a file conflict, not a configuration. And
+the per-account alternatives are what this replaces: a login script
+that runs forever to patch accounts one by one, and a layout script
+that only ever runs once, for an account that does not exist yet.
+
+--- a/desktoppackage/contents/defaults
++++ b/desktoppackage/contents/defaults
+@@ -6,6 +6,7 @@
+ [Desktop][ContainmentActions]
+ RightButton;NoModifier=org.kde.contextmenu
+ MiddleButton;NoModifier=org.kde.paste
++wheel:Vertical;ControlModifier=org.raye.desktopmenu
+ 
+ [Panel]
+ Containment=org.kde.panel

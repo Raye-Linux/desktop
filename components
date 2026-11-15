@@ -1,0 +1,10 @@
+# The desktop packages Raye builds itself, in build order, one per line:
+#
+#   <source package> <upstream version built against>
+#
+# The version is the Ubuntu source version the patches in patches/<source>
+# were written against. build.sh refuses to build a different one without
+# REBASE=1, because a patch that still applies to a newer source is not the
+# same as a patch that is still right for it.
+plasma-workspace 6.6.6-0ubuntu0.1
+plasma-desktop 6.6.6-0ubuntu0.1

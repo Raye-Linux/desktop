@@ -1,0 +1,363 @@
+Subject: the desktop keeps Ctrl + wheel when it holds enough icons to scroll
+
+Ctrl + wheel on the desktop resizes the icons, through the containment
+action bound to wheel:Vertical;ControlModifier. The Folder view hands
+wheel events to the containment with a WheelInterceptor, and that
+interceptor turned itself off as soon as the grid could scroll
+(`!gridView.overflowing`). On a desktop with more icons than fit, the
+grid therefore took every wheel event first, and Ctrl + wheel scrolled
+instead of resizing: the gesture disappeared exactly on the desktops
+busy enough to need it.
+
+The interceptor now stays on and is told whether something below it
+scrolls. A plain wheel is let through, so scrolling is untouched; a
+wheel held with Ctrl goes to the containment, so the gesture holds.
+Other modifiers keep the scrolling they have today, because widening
+the exception to every modifier would quietly take Shift + wheel away
+from the view below.
+
+Its test comes with it, and so does what makes a Raye test run at all,
+since this is the first one in the series. 🚨 That took three attempts,
+because each failure looked like a pass. The packaging configures with
+-DBUILD_TESTING=OFF and empties dh_auto_test, because one of the upstream
+tests never ends, so a test added to an upstream autotests/ directory is
+never run. Hence:
+
+  * Raye's tests live in their own directory, gated on RAYE_TESTING,
+    which the packaging turns on. Upstream's stay off, exactly as Ubuntu
+    left them, and turning their directory on to reach one test would
+    bring the one that never ends back with it.
+  * enable_testing() is called by hand, because include(CTest) only calls
+    it when BUILD_TESTING is on; without it add_test() registers nothing.
+  * ctest runs with --no-tests=error, because it exits 0 when it finds
+    nothing to run. That is how the first two attempts passed: the build
+    said nothing, and there was nothing to say.
+  * dh calls an override even under nocheck, so that skip is written out.
+
+Reason: this cannot be done outside the source. The binding that turns
+the interceptor off lives inside the containment's own QML package, and
+no setting, script or look-and-feel package can reach it. Once it is
+off, the wheel event never arrives at the containment at all, so no
+containment action, plugin or shell script downstream has anything to
+act on. The test has to run where the code is built, which is why the
+switch that runs it belongs here too.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -100,6 +100,18 @@
+     include(ECMAddTests)
+ endif()
+ 
++# Raye's own tests. The packaging configures with BUILD_TESTING=OFF, because
++# one of the upstream tests never ends, so upstream's stay off and Raye's get
++# a switch of their own that the packaging turns on.
++#
++# 🚨 enable_testing() is called by hand here: include(CTest) only calls it
++# when BUILD_TESTING is on. Without it add_test() registers nothing, and
++# ctest then reports that it found no test -- and exits 0. That is a build
++# that looks tested and is not.
++if(RAYE_TESTING)
++    enable_testing()
++endif()
++
+ if(BUILD_DOC)
+     find_package(KF6DocTools ${KF6_MIN_VERSION})
+     set_package_properties(KF6DocTools PROPERTIES
+--- a/debian/rules
++++ b/debian/rules
+@@ -6,6 +6,10 @@
+ #l10npkgs_firstversion_ok := 4:17.08.3-3~
+ #include /usr/share/pkg-kde-tools/qt-kde-team/2/l10n-packages.mk
+ 
++# DEB_HOST_GNU_TYPE: the name dh gives the build folder, which the Raye
++# tests are run from
++include /usr/share/dpkg/architecture.mk
++
+ #DEB_HOST_ARCH ?= $(shell dpkg-architecture -qDEB_HOST_ARCH)
+ #ifneq (,$(filter $(DEB_HOST_ARCH), armel armhf mips mipsel))
+ #    export DEB_CFLAGS_MAINT_STRIP = -g
+@@ -18,12 +22,22 @@
+ 	dh $@
+ 
+ override_dh_auto_configure:
+-	dh_auto_configure -- -DBUILD_TESTING=OFF
++	dh_auto_configure -- -DBUILD_TESTING=OFF -DRAYE_TESTING=ON
+ 
+ override_dh_auto_test:
+-	# Disable dh_auto_test, fourth test never ends
+-	# xvfb-run -a dh_auto_test
+-	:
++	# Upstream's own tests stay off, as they were: one of them never ends.
++	# Raye's do run. A patch of the Raye series changes how the desktop
++	# behaves, and a change nobody checks where it is built is a change
++	# that comes undone on the next rebase without a word.
++	#
++	# dh calls an override even under nocheck, so the skip is written here.
++ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
++	# --no-tests=error: ctest exits 0 when it finds nothing to run, so
++	# without it a series whose tests stopped being registered would build
++	# green for ever.
++	ctest --test-dir obj-$(DEB_HOST_GNU_TYPE) -R '^raye' \
++		--no-tests=error --output-on-failure
++endif
+ 
+ #override_dh_gencontrol-indep: l10npkgs_firstversion_ok
+ #	dh_gencontrol -i
+--- a/containments/desktop/plugins/folder/CMakeLists.txt
++++ b/containments/desktop/plugins/folder/CMakeLists.txt
+@@ -52,3 +52,9 @@
+ if(BUILD_TESTING)
+     add_subdirectory(autotests)
+ endif(BUILD_TESTING)
++
++# Raye's own tests of this plugin, which the package build runs even though
++# it builds with BUILD_TESTING=OFF
++if(BUILD_TESTING OR RAYE_TESTING)
++    add_subdirectory(raye-autotests)
++endif()
+--- a/containments/desktop/plugins/folder/wheelinterceptor.h
++++ b/containments/desktop/plugins/folder/wheelinterceptor.h
+@@ -16,6 +16,7 @@
+     QML_ELEMENT
+ 
+     Q_PROPERTY(QObject *destination READ destination WRITE setDestination NOTIFY destinationChanged)
++    Q_PROPERTY(bool scrollsBelow READ scrollsBelow WRITE setScrollsBelow NOTIFY scrollsBelowChanged)
+ 
+ public:
+     explicit WheelInterceptor(QQuickItem *parent = nullptr);
+@@ -24,12 +25,17 @@
+     QObject *destination() const;
+     void setDestination(QObject *destination);
+ 
++    bool scrollsBelow() const;
++    void setScrollsBelow(bool scrollsBelow);
++
+ Q_SIGNALS:
+     void destinationChanged() const;
++    void scrollsBelowChanged() const;
+ 
+ protected:
+     void wheelEvent(QWheelEvent *event) override;
+ 
+ private:
+     QPointer<QObject> m_destination;
++    bool m_scrollsBelow = false;
+ };
+--- a/containments/desktop/plugins/folder/wheelinterceptor.cpp
++++ b/containments/desktop/plugins/folder/wheelinterceptor.cpp
+@@ -31,8 +31,35 @@
+     }
+ }
+ 
++bool WheelInterceptor::scrollsBelow() const
++{
++    return m_scrollsBelow;
++}
++
++void WheelInterceptor::setScrollsBelow(bool scrollsBelow)
++{
++    if (m_scrollsBelow != scrollsBelow) {
++        m_scrollsBelow = scrollsBelow;
++
++        Q_EMIT scrollsBelowChanged();
++    }
++}
++
+ void WheelInterceptor::wheelEvent(QWheelEvent *event)
+ {
++    // When there is a view below that can scroll, a plain wheel belongs to it:
++    // let the event through rather than hand it to the destination, which
++    // would swallow the scrolling of a desktop that holds more icons than fit.
++    //
++    // Ctrl + wheel is the exception, because it is never a scroll anywhere: it
++    // is the gesture that changes a size, and the destination binds it. Any
++    // other modifier keeps the scrolling it has today; widening this to every
++    // modifier would silently take Shift + wheel away from the view below.
++    if (m_scrollsBelow && !(event->modifiers() & Qt::ControlModifier)) {
++        event->ignore();
++        return;
++    }
++
+     if (m_destination) {
+         QCoreApplication::sendEvent(m_destination, event);
+     }
+--- a/containments/desktop/package/contents/ui/FolderView.qml
++++ b/containments/desktop/package/contents/ui/FolderView.qml
+@@ -1242,7 +1242,11 @@
+         Folder.WheelInterceptor {
+             anchors.fill: parent
+ 
+-            enabled: root.isContainment && !gridView.overflowing
++            // Stays on even when the grid can scroll: it lets a plain wheel
++            // through to the grid and keeps Ctrl + wheel for the containment,
++            // which would otherwise lose its gesture on a crowded desktop.
++            enabled: root.isContainment
++            scrollsBelow: gridView.overflowing
+             destination: root
+         }
+ 
+--- /dev/null
++++ b/containments/desktop/plugins/folder/raye-autotests/CMakeLists.txt
+@@ -0,0 +1,20 @@
++# Raye's own test of this plugin, in a directory of its own rather than in
++# autotests/: the packaging builds with BUILD_TESTING=OFF, because one of
++# the upstream tests never ends, and a Raye patch still has to be checked
++# where it is built. Turning the upstream directory on to reach one test
++# would bring that one back with it.
++#
++# Asked for here on purpose: with BUILD_TESTING off nothing else in the tree
++# pulls Qt6::Test in.
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test Quick)
++
++add_executable(tst_rayewheelinterceptor
++    tst_rayewheelinterceptor.cpp
++    ../wheelinterceptor.cpp)
++target_include_directories(tst_rayewheelinterceptor PRIVATE ..)
++target_link_libraries(tst_rayewheelinterceptor PRIVATE Qt6::Test Qt6::Quick)
++# the name begins with raye: that is what the package build runs
++add_test(NAME rayewheelinterceptor COMMAND tst_rayewheelinterceptor)
++set_tests_properties(rayewheelinterceptor PROPERTIES
++    TIMEOUT 60
++    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+--- /dev/null
++++ b/containments/desktop/plugins/folder/raye-autotests/tst_rayewheelinterceptor.h
+@@ -0,0 +1,21 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QObject>
++
++class RayeWheelInterceptorTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void handsAPlainWheelToTheDestinationWhenNothingBelowScrolls();
++    void letsAPlainWheelThroughToTheViewThatScrolls();
++    void keepsControlWheelForTheDestinationOverAScrollingView();
++    void leavesOtherModifiersToTheViewThatScrolls();
++    void doesNothingWithoutADestination();
++};
+--- /dev/null
++++ b/containments/desktop/plugins/folder/raye-autotests/tst_rayewheelinterceptor.cpp
+@@ -0,0 +1,115 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "tst_rayewheelinterceptor.h"
++#include "wheelinterceptor.h"
++
++#include <QTest>
++#include <QWheelEvent>
++
++QTEST_MAIN(RayeWheelInterceptorTest)
++
++namespace
++{
++// Counts the wheel events the interceptor forwards. A plain QObject is what
++// the interceptor is really given in the containment, so the test uses one.
++class Destination : public QObject
++{
++public:
++    int wheels = 0;
++    Qt::KeyboardModifiers lastModifiers = Qt::NoModifier;
++
++    bool event(QEvent *e) override
++    {
++        if (e->type() == QEvent::Wheel) {
++            ++wheels;
++            lastModifiers = static_cast<QWheelEvent *>(e)->modifiers();
++        }
++        return QObject::event(e);
++    }
++};
++
++QWheelEvent scrollDown(Qt::KeyboardModifiers modifiers)
++{
++    return QWheelEvent(QPointF(0, 0), QPointF(0, 0), QPoint(0, 0), QPoint(0, -120), Qt::NoButton, modifiers, Qt::NoScrollPhase, false);
++}
++
++// Sends the event the way the window does, through QQuickItem::event().
++// An event left unaccepted is one the window goes on to offer to the items
++// underneath; that is what "let through" means here.
++bool deliver(WheelInterceptor *interceptor, QWheelEvent &event)
++{
++    QCoreApplication::sendEvent(interceptor, &event);
++    return event.isAccepted();
++}
++}
++
++void RayeWheelInterceptorTest::handsAPlainWheelToTheDestinationWhenNothingBelowScrolls()
++{
++    WheelInterceptor interceptor;
++    Destination destination;
++    interceptor.setDestination(&destination);
++    interceptor.setScrollsBelow(false);
++
++    QWheelEvent event = scrollDown(Qt::NoModifier);
++    QVERIFY(deliver(&interceptor, event));
++    QCOMPARE(destination.wheels, 1);
++}
++
++void RayeWheelInterceptorTest::letsAPlainWheelThroughToTheViewThatScrolls()
++{
++    WheelInterceptor interceptor;
++    Destination destination;
++    interceptor.setDestination(&destination);
++    interceptor.setScrollsBelow(true);
++
++    QWheelEvent event = scrollDown(Qt::NoModifier);
++    QVERIFY(!deliver(&interceptor, event));
++    QCOMPARE(destination.wheels, 0);
++}
++
++void RayeWheelInterceptorTest::keepsControlWheelForTheDestinationOverAScrollingView()
++{
++    WheelInterceptor interceptor;
++    Destination destination;
++    interceptor.setDestination(&destination);
++    interceptor.setScrollsBelow(true);
++
++    QWheelEvent event = scrollDown(Qt::ControlModifier);
++    QVERIFY(deliver(&interceptor, event));
++    QCOMPARE(destination.wheels, 1);
++    QCOMPARE(destination.lastModifiers, Qt::ControlModifier);
++
++    // and with another modifier held alongside it
++    QWheelEvent both = scrollDown(Qt::ControlModifier | Qt::ShiftModifier);
++    QVERIFY(deliver(&interceptor, both));
++    QCOMPARE(destination.wheels, 2);
++}
++
++void RayeWheelInterceptorTest::leavesOtherModifiersToTheViewThatScrolls()
++{
++    WheelInterceptor interceptor;
++    Destination destination;
++    interceptor.setDestination(&destination);
++    interceptor.setScrollsBelow(true);
++
++    for (const Qt::KeyboardModifiers modifiers : {Qt::KeyboardModifiers(Qt::ShiftModifier), Qt::KeyboardModifiers(Qt::AltModifier), Qt::KeyboardModifiers(Qt::MetaModifier)}) {
++        QWheelEvent event = scrollDown(modifiers);
++        QVERIFY(!deliver(&interceptor, event));
++    }
++    QCOMPARE(destination.wheels, 0);
++}
++
++void RayeWheelInterceptorTest::doesNothingWithoutADestination()
++{
++    WheelInterceptor interceptor;
++    interceptor.setScrollsBelow(false);
++
++    QWheelEvent event = scrollDown(Qt::ControlModifier);
++    deliver(&interceptor, event);
++    // nothing to assert but that it did not crash
++    QVERIFY(interceptor.destination() == nullptr);
++}

@@ -1,0 +1,481 @@
+Subject: a layout reached through the fallback is not the look's own layout
+
+patches/plasma-desktop/0003 moved the default layout out of the Raye
+look-and-feel package and into the shell package's contents/layout.js,
+which libplasma's Plasma/Shell structure maps to `defaultlayout`. It is
+installed, it is byte-identical in the .deb and in the image, and run by
+hand it builds the Raye taskbar -- and a new account still got upstream's
+bar: kickoff, pager, icontasks, systemtray, digitalclock, showdesktop.
+The script was never read.
+
+ShellCorona::loadDefaultLayout() asks the active look-and-feel package for
+a layout first and this shell package's `defaultlayout` only if that came
+back empty -- in outline:
+
+    script = m_lookAndFeelPackage.filePath("layouts", shell() + "-layout.js");
+    if (script.isEmpty()) {
+        script = kPackage().filePath("defaultlayout");
+    }
+
+It never came back empty. shell/packageplugins/lookandfeel gives every
+look-and-feel package whose id is not org.kde.breeze.desktop a KPackage
+*fallback* to org.kde.breeze.desktop, and KPackage::Package::filePath()
+answers out of that fallback when the active package has no such file of
+its own. All three Breeze packages ship
+layouts/org.kde.plasma.desktop-layout.js. So a look that carries no layout
+-- which is exactly what 0003 made the Raye look -- was handed Breeze's,
+and the shell package's own layout below was unreachable for every account
+on the machine.
+
+🚨 Measured, not inferred, and on two separate benches -- which matters,
+because each one alone has an innocent reading:
+
+  * in the image: moving Breeze's layouts/ aside brings the Raye taskbar
+    back, and putting it back brings upstream's. That proves the causation
+    and names no line of code.
+  * against a real KPackage: a valid look-and-feel package with no layouts/
+    and a fallback to org.kde.breeze.desktop is answered Breeze's path by
+    filePath(). That names the line.
+
+🚨 And the package split is what says this belongs in plasma-workspace and
+not in plasma-desktop, measured in the image's dpkg lists: Breeze's
+layouts/ is in plasma-workspace-data, while the Raye layout.js that was
+being shadowed is in plasma-desktop-data. The file is one source package
+and the thing hiding it is another.
+
+The lookup now asks for a layout the active package really ships. A look
+that carries one keeps it -- a third-party theme loses nothing -- and a
+look that carries none lets the desktop's own layout through, which is
+the whole point of 0003.
+
+The pre-layout lookup one block above has the same flaw and is corrected
+with it: Breeze happens to ship no <shell>-prelayout.js today, so nothing
+is wrong in the image, but the question being asked is the wrong one and
+the next Breeze release would answer it.
+
+⚠️ The emptiness of path() is tested separately, and it is load-bearing:
+QString::startsWith(QString()) is true for every string, and an invalid
+look-and-feel package has an empty path() while filePath() still answers
+out of the fallback. Measured: with that test removed, Breeze's layout
+comes through again on that path alone.
+
+⚠️ The other filePath() calls on the look-and-feel package are left as
+they are, and that is deliberate. For "defaults" and "plasmoidsetupscripts"
+the fallback is the feature: a look that overrides nothing should be given
+Breeze's. "layouts" is the one key where falling back preempts a file the
+shell package owns.
+
+This is the first patch of the plasma-workspace series, so it also brings
+what makes a Raye test run at all. This packaging has the same traps as
+plasma-desktop's: it configures with -DBUILD_TESTING=OFF and empties
+dh_auto_test, so each of these is written out rather than assumed:
+
+  * Raye's tests live in a directory of their own, gated on RAYE_TESTING,
+    which the packaging turns on. Upstream's stay off exactly as Ubuntu
+    left them.
+  * enable_testing() is called by hand, because include(CTest) only calls
+    it when BUILD_TESTING is on; without it add_test() registers nothing.
+  * ctest runs with --no-tests=error, because it exits 0 when it finds
+    nothing to run.
+  * dh calls an override even under nocheck, so that skip is written out.
+
+The test builds the lookup against a real KPackage and three
+look-and-feel packages it lays down itself, so it does not read whatever
+looks happen to be installed on the build machine. One of its cases
+asserts that KPackage still falls a missing file through to the fallback
+at all: the day it stops, this patch is no longer needed, and the test
+says so rather than leaving a correction nobody can explain.
+
+Reason: this cannot be done outside the source. The order of the two
+lookups, and the fallback that makes the first one answer, are both
+compiled into plasmashell and its look-and-feel package-structure plugin
+-- no configuration file, script or look-and-feel package can reach
+either. The alternatives all give up something that was the point of
+0003: shipping layouts/ in the Raye look puts the shape of the desktop
+back inside a theme, where it travels with the colours; shipping a file
+over plasma-desktop's contents/layout.js from another package is a file
+conflict; and unsetting LookAndFeelPackage so no look is active would
+take Night and Day away. The test has to run where the code is built.
+
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -86,6 +86,18 @@
+     find_package(Qt6 REQUIRED CONFIG COMPONENTS WaylandCompositor)
+ endif()
+ 
++# Raye's own tests. The packaging configures with BUILD_TESTING=OFF and empties
++# dh_auto_test, so upstream's stay off exactly as Ubuntu left them and Raye's
++# get a switch of their own that the packaging turns on.
++#
++# 🚨 enable_testing() is called by hand here: include(CTest) only calls it when
++# BUILD_TESTING is on. Without it add_test() registers nothing, ctest then
++# reports that it found no test -- and exits 0. That is a build that looks
++# tested and is not.
++if(RAYE_TESTING)
++    enable_testing()
++endif()
++
+ find_package(KF6Kirigami ${KF6_MIN_VERSION} CONFIG)
+ set_package_properties(KF6Kirigami PROPERTIES
+     DESCRIPTION "A QtQuick based components set"
+--- a/debian/rules
++++ b/debian/rules
+@@ -2,6 +2,10 @@
+ 
+ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+ 
++# DEB_HOST_GNU_TYPE: the name dh gives the build folder, which the Raye tests
++# are run from
++include /usr/share/dpkg/architecture.mk
++
+ %:
+ 	dh $@
+ 
+@@ -9,11 +13,22 @@
+ 	dh_python3 usr/share/kconf_update/
+ 
+ override_dh_auto_configure:
+-	dh_auto_configure -- -DBUILD_TESTING=OFF -DPLASMA_X11_DEFAULT_SESSION=OFF -DWITH_X11=ON -DUBUNTU_PACKAGEKIT=FALSE
++	dh_auto_configure -- -DBUILD_TESTING=OFF -DRAYE_TESTING=ON -DPLASMA_X11_DEFAULT_SESSION=OFF -DWITH_X11=ON -DUBUNTU_PACKAGEKIT=FALSE
+ 
+ override_dh_auto_test:
+-	# Disable auto tests at build time
+-	:
++	# Upstream's own tests stay off at build time, as they were. Raye's do run:
++	# a patch of the Raye series changes how the desktop behaves, and a change
++	# nobody checks where it is built is a change that comes undone on the next
++	# rebase without a word.
++	#
++	# dh calls an override even under nocheck, so the skip is written here.
++ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
++	# --no-tests=error: ctest exits 0 when it finds nothing to run, so without
++	# it a series whose tests stopped being registered would build green for
++	# ever.
++	ctest --test-dir obj-$(DEB_HOST_GNU_TYPE) -R '^raye' \
++		--no-tests=error --output-on-failure
++endif
+ 
+ #override_dh_makeshlibs:
+ #	dh_makeshlibs -V -- -c0
+--- a/shell/CMakeLists.txt
++++ b/shell/CMakeLists.txt
+@@ -172,4 +172,10 @@
+    add_subdirectory(tests)
+ endif()
+ 
++# Raye's own tests of this shell, which the package build runs even though it
++# builds with BUILD_TESTING=OFF
++if(BUILD_TESTING OR RAYE_TESTING)
++    add_subdirectory(raye-autotests)
++endif()
++
+ add_subdirectory(kconf_update)
+--- /dev/null
++++ b/shell/lookandfeellayout.h
+@@ -0,0 +1,47 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <KPackage/Package>
++
++#include <QString>
++
++/**
++ * The layout script the active look-and-feel package really ships, and an
++ * empty string when it ships none -- so that the shell package's own
++ * `defaultlayout` is reached instead.
++ *
++ * 🚨 KPackage::Package::filePath() answers out of the package's *fallback*
++ * when the active package has no such file of its own, and
++ * shell/packageplugins/lookandfeel gives every look-and-feel package but
++ * org.kde.breeze.desktop a fallback to org.kde.breeze.desktop. All three
++ * Breeze packages ship layouts/org.kde.plasma.desktop-layout.js, so asking
++ * the active package for a layout it does not have is answered Breeze's --
++ * and because that answer is not empty, the `defaultlayout` of the shell
++ * package is never consulted at all.
++ *
++ * ⚠️ The emptiness of path() has to be tested on its own:
++ * QString::startsWith(QString()) is true for every string, and an invalid
++ * package has an empty path() while filePath() still answers out of the
++ * fallback. Measured: without that test the fallback's layout comes through.
++ *
++ * Package::path() is canonical and always ends in '/', and filePath() builds
++ * its answer by prepending it, so the prefix test is exact: no path outside
++ * the package directory can begin with it.
++ */
++inline QString ownLookAndFeelLayout(const KPackage::Package &lookAndFeel, const QString &fileName)
++{
++    if (!lookAndFeel.isValid()) {
++        return QString();
++    }
++    const QString root = lookAndFeel.path();
++    if (root.isEmpty()) {
++        return QString();
++    }
++    const QString found = lookAndFeel.filePath("layouts", fileName);
++    return found.startsWith(root) ? found : QString();
++}
+--- a/shell/shellcorona.cpp
++++ b/shell/shellcorona.cpp
+@@ -57,6 +57,7 @@
+ #include "futureutil.h"
+ #include "kconfigloader.h"
+ #include "kconfigpropertymap.h"
++#include "lookandfeellayout.h"
+ #include "osd.h"
+ #include "panelview.h"
+ #include "plasmashelladaptor.h"
+@@ -1057,8 +1058,10 @@
+ void ShellCorona::loadDefaultLayout()
+ {
+ #if USE_SCRIPTING
+-    // pre-startup scripts
+-    QString script = m_lookAndFeelPackage.filePath("layouts", QString(shell() + u"-prelayout.js"));
++    // pre-startup scripts, from the active look-and-feel package and only from
++    // it: ownLookAndFeelLayout() says why asking the package itself is not the
++    // same question as asking KPackage.
++    QString script = ownLookAndFeelLayout(m_lookAndFeelPackage, QString(shell() + u"-prelayout.js"));
+     if (!script.isEmpty()) {
+         QFile file(script);
+         if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+@@ -1090,7 +1093,12 @@
+     script = m_testModeLayout;
+ 
+     if (script.isEmpty()) {
+-        script = m_lookAndFeelPackage.filePath("layouts", QString(shell() + u"-layout.js"));
++        // 🚨 Only a layout this look-and-feel package ships itself. Asking
++        // KPackage for one it does not have is answered out of the fallback
++        // to org.kde.breeze.desktop, which does ship one -- and a non-empty
++        // answer meant the shell package's defaultlayout below was never
++        // reached, whatever look was active.
++        script = ownLookAndFeelLayout(m_lookAndFeelPackage, QString(shell() + u"-layout.js"));
+     }
+     if (script.isEmpty()) {
+         script = kPackage().filePath("defaultlayout");
+--- /dev/null
++++ b/shell/raye-autotests/CMakeLists.txt
+@@ -0,0 +1,22 @@
++# Raye's own tests of this shell, in a directory of their own rather than in
++# autotests/: the packaging builds with BUILD_TESTING=OFF and empties
++# dh_auto_test, and a Raye patch still has to be checked where it is built.
++# Turning the upstream directory on to reach one test would bring upstream's
++# whole suite -- and its Wayland compositor dependency -- back with it.
++#
++# Qt6::Test is asked for here on purpose: with BUILD_TESTING off nothing else
++# in the tree pulls it in. KF6::Package is already a required component of the
++# top-level project, so the test does not ask for it again.
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test)
++
++# lookandfeellayout.h is header-only, so the test needs none of plasmashell's
++# objects: it builds against KPackage alone, which is exactly the behaviour
++# under test.
++add_executable(tst_rayelookandfeellayout tst_rayelookandfeellayout.cpp)
++target_include_directories(tst_rayelookandfeellayout PRIVATE ..)
++target_link_libraries(tst_rayelookandfeellayout PRIVATE Qt6::Test KF6::Package)
++# the name begins with raye: that is what the package build runs
++add_test(NAME rayelookandfeellayout COMMAND tst_rayelookandfeellayout)
++set_tests_properties(rayelookandfeellayout PROPERTIES
++    TIMEOUT 60
++    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+--- /dev/null
++++ b/shell/raye-autotests/tst_rayelookandfeellayout.h
+@@ -0,0 +1,28 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QObject>
++#include <QTemporaryDir>
++
++class RayeLookAndFeelLayoutTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void initTestCase();
++
++    void findsTheLayoutAlookShipsItself();
++    void refusesTheLayoutReachedThroughTheFallback();
++    void refusesTheFallbacksLayoutWhenThePackageIsInvalid();
++    void leavesBreezeItsOwnLayout();
++    void returnsNothingWhenNobodyShipsALayout();
++    void kpackageStillFallsBackAtAll();
++
++private:
++    QTemporaryDir m_root;
++};
+--- /dev/null
++++ b/shell/raye-autotests/tst_rayelookandfeellayout.cpp
+@@ -0,0 +1,163 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "tst_rayelookandfeellayout.h"
++#include "lookandfeellayout.h"
++
++#include <KPackage/PackageStructure>
++
++#include <QDir>
++#include <QFile>
++#include <QTest>
++
++QTEST_MAIN(RayeLookAndFeelLayoutTest)
++
++namespace
++{
++const QLatin1String LAYOUT("org.kde.plasma.desktop-layout.js");
++const QLatin1String BREEZE("org.kde.breeze.desktop");
++
++// The one definition of the Plasma/LookAndFeel structure this is about, taken
++// from shell/packageplugins/lookandfeel/lookandfeel.cpp. The structure plugin
++// itself is not used, so the test does not need it installed, and it does not
++// read whatever look-and-feel packages happen to be on the build machine.
++class LookAndFeelLike : public KPackage::PackageStructure
++{
++public:
++    void initPackage(KPackage::Package *package) override
++    {
++        package->removeDefinition("mainscript");
++        package->addDirectoryDefinition("layouts", QStringLiteral("layouts"));
++    }
++};
++
++void writeFile(const QString &path, const QByteArray &contents)
++{
++    QFile file(path);
++    QVERIFY2(file.open(QIODevice::WriteOnly), qPrintable(path));
++    file.write(contents);
++}
++}
++
++void RayeLookAndFeelLayoutTest::initTestCase()
++{
++    QVERIFY(m_root.isValid());
++
++    // three look-and-feel packages on disk: Breeze and a third-party look that
++    // ship a layout, and a Raye-shaped look that ships none -- which is the
++    // whole point of patch 0003 of plasma-desktop
++    const auto make = [this](const QLatin1String &id, bool withLayout) {
++        const QString dir = m_root.filePath(id);
++        QVERIFY(QDir().mkpath(dir + QStringLiteral("/contents")));
++        writeFile(dir + QStringLiteral("/metadata.json"),
++                  QStringLiteral("{\"KPlugin\":{\"Id\":\"%1\",\"Name\":\"%1\"}}").arg(id).toUtf8());
++        if (withLayout) {
++            QVERIFY(QDir().mkpath(dir + QStringLiteral("/contents/layouts")));
++            writeFile(dir + QStringLiteral("/contents/layouts/") + LAYOUT, QByteArrayLiteral("// ") + id.data());
++        }
++    };
++    make(BREEZE, true);
++    make(QLatin1String("org.third.party.desktop"), true);
++    make(QLatin1String("org.raye.night.desktop"), false);
++    make(QLatin1String("org.nobody.desktop"), false);
++}
++
++namespace
++{
++// A look-and-feel package the way ShellCorona holds one: the active package,
++// with the fallback that lookandfeel.cpp's pathChanged() gives every package
++// whose id is not org.kde.breeze.desktop.
++KPackage::Package activeLook(const QTemporaryDir &root, const QString &id)
++{
++    KPackage::Package breeze(new LookAndFeelLike);
++    breeze.setPath(root.filePath(BREEZE));
++
++    KPackage::Package look(new LookAndFeelLike);
++    look.setPath(root.filePath(id));
++    if (id != BREEZE) {
++        look.setFallbackPackage(breeze);
++    }
++    return look;
++}
++}
++
++void RayeLookAndFeelLayoutTest::findsTheLayoutAlookShipsItself()
++{
++    // a look that really carries a layout keeps it: this is not about taking
++    // the feature away from a third-party theme
++    const KPackage::Package look = activeLook(m_root, QStringLiteral("org.third.party.desktop"));
++    const QString found = ownLookAndFeelLayout(look, LAYOUT);
++    QVERIFY(!found.isEmpty());
++    QVERIFY(found.startsWith(look.path()));
++    QVERIFY(QFile::exists(found));
++}
++
++void RayeLookAndFeelLayoutTest::refusesTheLayoutReachedThroughTheFallback()
++{
++    // 🚨 the bug this patch is for: the look ships no layout, KPackage answers
++    // Breeze's, the answer is not empty, and ShellCorona therefore never looks
++    // at the shell package's own defaultlayout
++    const KPackage::Package look = activeLook(m_root, QStringLiteral("org.raye.night.desktop"));
++
++    const QString throughKPackage = look.filePath("layouts", LAYOUT);
++    QVERIFY2(!throughKPackage.isEmpty(),
++             "KPackage no longer answers out of the fallback: this test is checking nothing");
++    QVERIFY(throughKPackage.contains(BREEZE));
++
++    QVERIFY2(ownLookAndFeelLayout(look, LAYOUT).isEmpty(),
++             "the fallback's layout came through, so the shell package's defaultlayout is still "
++             "unreachable and a new account starts with upstream's taskbar");
++}
++
++void RayeLookAndFeelLayoutTest::refusesTheFallbacksLayoutWhenThePackageIsInvalid()
++{
++    // ⚠️ the corner the prefix test cannot carry on its own: an invalid package
++    // has an empty path(), QString::startsWith(QString()) is true for every
++    // string, and filePath() still answers out of the fallback
++    KPackage::Package breeze(new LookAndFeelLike);
++    breeze.setPath(m_root.filePath(BREEZE));
++
++    KPackage::Package broken(new LookAndFeelLike);
++    broken.setFallbackPackage(breeze);
++
++    QVERIFY(!broken.isValid());
++    QVERIFY(broken.path().isEmpty());
++    QVERIFY(!broken.filePath("layouts", LAYOUT).isEmpty());
++    QVERIFY(ownLookAndFeelLayout(broken, LAYOUT).isEmpty());
++}
++
++void RayeLookAndFeelLayoutTest::leavesBreezeItsOwnLayout()
++{
++    // Breeze is given no fallback at all, and must still find its own layout:
++    // a Raye desktop with the Breeze look is Breeze's desktop
++    const KPackage::Package look = activeLook(m_root, BREEZE);
++    const QString found = ownLookAndFeelLayout(look, LAYOUT);
++    QVERIFY(!found.isEmpty());
++    QVERIFY(found.startsWith(look.path()));
++}
++
++void RayeLookAndFeelLayoutTest::returnsNothingWhenNobodyShipsALayout()
++{
++    KPackage::Package look(new LookAndFeelLike);
++    look.setPath(m_root.filePath(QStringLiteral("org.nobody.desktop")));
++    QVERIFY(look.isValid());
++    QVERIFY(ownLookAndFeelLayout(look, LAYOUT).isEmpty());
++}
++
++void RayeLookAndFeelLayoutTest::kpackageStillFallsBackAtAll()
++{
++    // The patch is only needed because KPackage falls a missing file through to
++    // the fallback package. If a KPackage release ever stopped doing that, this
++    // fails and says so, rather than leaving a correction nobody can explain.
++    KPackage::Package breeze(new LookAndFeelLike);
++    breeze.setPath(m_root.filePath(BREEZE));
++
++    KPackage::Package look(new LookAndFeelLike);
++    look.setPath(m_root.filePath(QStringLiteral("org.nobody.desktop")));
++    look.setFallbackPackage(breeze);
++
++    QCOMPARE(look.filePath("layouts", LAYOUT), breeze.filePath("layouts", LAYOUT));
++}

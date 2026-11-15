@@ -1,0 +1,223 @@
+Subject: the notification area draws its icons at 16 px, and keeps one row
+
+The owner's ask of 2026-11-04 is a notification area like Windows 11's:
+small icons, one row. Measured first, because the plan said nothing about
+where the size comes from.
+
+🚨 Measured on 2026-11-06, against this source:
+
+    applets/systemtray/qml/main.qml:185
+        readonly property int smallIconSize: Kirigami.Units.iconSizes.smallMedium
+    applets/systemtray/qml/main.qml:193
+        rowsOrColumns: ... Math.floor(gridThickness / (smallIconSize + smallSpacing))
+    applets/systemtray/main.xml:33
+        "tray icons will be capped at the smallMedium size (22px)"
+
+and the numbers themselves, read out of the real Kirigami 6.13.0 on this
+machine rather than assumed (QT_QPA_PLATFORM=offscreen qml6):
+
+    iconSizes.small = 16   iconSizes.smallMedium = 22   smallSpacing = 4
+    roundedIconSize(16) = 16
+
+So today a tray icon is drawn at 22 logical units whenever the panel is not
+auto-scaling, which is the default (scaleIconsToFit defaults to false). That
+is the whole of the measurement: one property, one place.
+
+🚨 And the one-word change is wrong, which is the reason this patch is four
+files and not one line. The SAME property is the divisor that decides how
+many rows of icons the panel holds, so pointing it at iconSizes.small
+changes the row count too -- on the 48 px panel Raye itself ships
+(layout.js, patches/plasma-desktop/0003):
+
+    floor(48 / (22 + 4)) = 1 row      <- today, and what is wanted
+    floor(48 / (16 + 4)) = 2 rows     <- what smallIconSize: small gives
+
+Two rows of tray icons on Raye's own panel is the opposite of the look
+asked for, it reads as unfinished, and nothing would have said so: both
+numbers are valid, the applet loads, and the only evidence is on a screen.
+It is the same shape this tree has paid for repeatedly -- a value written
+where something else also reads it -- and this time it was caught by doing
+the arithmetic before the edit rather than after.
+
+The two therefore come apart, in a file of their own: the icon is
+iconSizes.small, the row divisor stays at iconSizes.smallMedium +
+smallSpacing, which is what it already was. Upstream's stated intent is
+preserved exactly along with it -- "Should change to 2 rows/columns on a
+56px panel" is still floor(56 / 26) = 2 -- so this patch changes the size
+of an icon and nothing else about the layout. root.oneRowOrColumn, which
+other parts of the applet read, keeps the value it has today.
+
+⚠️ Two traps that were checked rather than reasoned about.
+
+  * The size is NOT a pixel literal. Kirigami.Units.iconSizes scales with
+    the font and the device pixel ratio (IconSizes::iconScaleFactor, in
+    Kirigami/Platform/Units), so a high-density screen is handed 16
+    logical units and not 16 physical dots. A hard-coded 16 would have
+    been a bug on exactly the screens that notice.
+  * 16 is a size the icon themes really ship, so nothing is resampled and
+    nothing turns blurry: Raye's own theme has status/16 with real SVGs
+    (theme/icons/Raye-Dark), it inherits breeze-dark which ships /16 too,
+    and Kirigami's own roundedIconSize(16) is 16 -- it does not round the
+    request away to another size.
+
+⚠️ The new QML file is listed in plasma_add_applet(QML_SOURCES), and that
+is not housekeeping. The applet's QML is compiled into a module from an
+explicit list, so a file left out of it does not exist at runtime and the
+component fails to resolve -- the applet would not load at all. The test
+asserts the listing for that reason, because the failure is only visible in
+a session.
+
+⚠️ What this patch does NOT claim. It changes the size the applet asks for.
+It does not measure what the notification area looks like, because that
+needs a Plasma session and there is none on the machine this was written
+on. What is measured is the number, where it comes from, what it does to
+the row count, and that the theme can supply it.
+
+main.xml's label for scaleIconsToFit is updated with it: it is the only
+place in the source that writes the cap down, and leaving it saying 22px
+would leave a false statement next to the code it describes. It is not a
+string the configuration UI shows -- ConfigGeneral.qml has its own i18nc
+strings for the "Panel icon size" combobox -- so no translation regresses.
+That combobox's "Small" option now means what it says.
+
+Reason: this cannot be done outside the source. The size is a QML binding
+inside the system tray applet's compiled QML module; there is no
+configuration key for it, and the only key in the neighbourhood,
+scaleIconsToFit, does the opposite -- it abandons the fixed size and scales
+icons to the panel's thickness. A look-and-feel package cannot reach it
+either: the applet's QML is shipped by plasma-workspace, not by a theme,
+and the one mechanism that could override a file of it is a dpkg-divert,
+which this repository is explicitly moving away from. Splitting the icon
+size from the row divisor is a change of structure in that QML, which no
+setting of any kind can express.
+
+--- a/applets/systemtray/CMakeLists.txt
++++ b/applets/systemtray/CMakeLists.txt
+@@ -62,6 +62,7 @@
+         qml/ItemLoader.qml
+         qml/PlasmoidItem.qml
+         qml/PulseAnimation.qml
++        qml/RayeTrayMetrics.qml
+         qml/SystemTrayState.qml
+         qml/CompactApplet.qml
+         qml/config.qml
+--- a/applets/systemtray/main.xml
++++ b/applets/systemtray/main.xml
+@@ -30,7 +30,7 @@
+       <default></default>
+     </entry>
+     <entry name="scaleIconsToFit" type="bool">
+-      <label>Whether to automatically scale System Tray icons to fix the available thickness of the panel. If false, tray icons will be capped at the smallMedium size (22px) and become a two-row/column layout when the panel is thick.</label>
++      <label>Whether to automatically scale System Tray icons to fix the available thickness of the panel. If false, tray icons will be capped at the small size (16px) and become a two-row/column layout when the panel is thick.</label>
+       <default>false</default>
+     </entry>
+     <entry name="iconSpacing" type="int">
+--- /dev/null
++++ b/applets/systemtray/qml/RayeTrayMetrics.qml
+@@ -0,0 +1,64 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: LGPL-2.0-or-later
++*/
++
++import QtQuick
++
++import org.kde.kirigami as Kirigami
++
++/*
++ * The two numbers that decide how the notification area looks when the
++ * panel is not scaling its icons: how big an icon is drawn, and how thick
++ * one row of icons counts as.
++ *
++ * Upstream used ONE number for both -- Kirigami.Units.iconSizes.smallMedium,
++ * 22 -- so the icon was drawn at 22 and the number of rows was the panel's
++ * thickness divided by 22 + smallSpacing. Raye draws tray icons at
++ * iconSizes.small, 16, and that is exactly why the two have to come apart.
++ * Measured against the panel Raye itself ships, 48 px (layout.js of
++ * patches/plasma-desktop/0003), with smallSpacing = 4:
++ *
++ *     floor(48 / (22 + 4)) = 1 row      <- upstream, and what is wanted
++ *     floor(48 / (16 + 4)) = 2 rows     <- what one shared number gives
++ *
++ * So the smaller icon on its own would have split the notification area
++ * into two rows on Raye's own panel, which is the opposite of the look
++ * asked for, and it would have done it quietly. The row count therefore
++ * keeps upstream's divisor, and upstream's intent with it ("Should change
++ * to 2 rows/columns on a 56px panel"): floor(56 / 26) is still 2.
++ *
++ * Neither value is a pixel literal, and that is deliberate.
++ * Kirigami.Units.iconSizes scales with the font and the device pixel ratio
++ * (IconSizes::iconScaleFactor), so a high-density screen is handed 16
++ * logical units, not 16 physical dots. 16 is also a size the icon themes
++ * really ship -- Raye's own status/16 and the breeze it inherits from --
++ * and roundedIconSize(16) is 16, so no tray icon is drawn at a size it
++ * would have to be resampled to.
++ *
++ * This is a file of its own rather than three expressions buried in
++ * main.qml so that the numbers can be measured without a Plasma session:
++ * tests/test_tray_icon_size.py in raye/desktop loads this very file and
++ * reads them back.
++ */
++QtObject {
++    /* The size a tray icon is drawn at, with "Panel icon size: Small". */
++    readonly property int iconSize: Kirigami.Units.iconSizes.small
++
++    /*
++     * How thick one row of icons counts as when working out how many rows
++     * fit in the panel. Deliberately not iconSize -- see above.
++     */
++    readonly property int rowThickness: Kirigami.Units.iconSizes.smallMedium + Kirigami.Units.smallSpacing
++
++    /*
++     * How many rows -- columns, on a vertical panel -- of icons a panel
++     * this thick holds for this many icons. Upstream's own formula, with
++     * the divisor given a name: never more rows than there are icons, and
++     * never fewer than one.
++     */
++    function rowsFor(thickness: int, count: int): int {
++        return Math.max(1, Math.min(count, Math.floor(thickness / rowThickness)));
++    }
++}
+--- a/applets/systemtray/qml/main.qml
++++ b/applets/systemtray/qml/main.qml
+@@ -51,6 +51,13 @@
+         }
+     }
+ 
++    // How big a tray icon is drawn, and how thick a row of them counts as.
++    // Two numbers upstream kept as one: see RayeTrayMetrics.qml, which says
++    // what drawing them at 16 would otherwise have done to the row count.
++    RayeTrayMetrics {
++        id: rayeMetrics
++    }
++
+     KItemModels.KSortFilterProxyModel {
+         id: activeModel
+         filterRoleName: "effectiveStatus"
+@@ -181,16 +188,21 @@
+                 interactive: false //disable features we don't need
+                 flow: root.vertical ? GridView.LeftToRight : GridView.TopToBottom
+ 
+-                // The icon size to display when not using the auto-scaling setting
+-                readonly property int smallIconSize: Kirigami.Units.iconSizes.smallMedium
++                // The icon size to display when not using the auto-scaling setting.
++                // Raye draws them at iconSizes.small, as Windows does; the row
++                // count below must NOT be derived from it. RayeTrayMetrics.qml.
++                readonly property int smallIconSize: rayeMetrics.iconSize
+ 
+                 // Automatically use autoSize setting when in tablet mode, if it's
+                 // not already being used
+                 readonly property bool autoSize: Plasmoid.configuration.scaleIconsToFit || Kirigami.Settings.tabletMode
+ 
+                 readonly property int gridThickness: root.vertical ? root.width : root.height
+-                // Should change to 2 rows/columns on a 56px panel (in standard DPI)
+-                readonly property int rowsOrColumns: autoSize ? 1 : Math.max(1, Math.min(count, Math.floor(gridThickness / (smallIconSize + Kirigami.Units.smallSpacing))))
++                // Should change to 2 rows/columns on a 56px panel (in standard DPI).
++                // The divisor is rayeMetrics.rowThickness and not smallIconSize:
++                // dividing by Raye's 16 px icon would give two rows on the 48 px
++                // panel Raye ships, where upstream's 22 gives one.
++                readonly property int rowsOrColumns: autoSize ? 1 : rayeMetrics.rowsFor(gridThickness, count)
+ 
+                 // Add margins only if the panel is larger than a small icon (to avoid large gaps between tiny icons)
+                 readonly property int cellSpacing: Kirigami.Units.smallSpacing * (Kirigami.Settings.tabletMode ? 6 : Plasmoid.configuration.iconSpacing)
