@@ -1,0 +1,367 @@
+Subject: X11 starts only when an X11 program needs it
+
+KWin starts Xwayland the first time a program connects to the display.
+Three parts of the session connected at every sign-in, so Xwayland, and the
+X11 helpers that come with it, were always in memory (about 30 MB):
+
+  * ksmserver forced the xcb platform. On Wayland it now runs on the
+    minimal platform (offscreen opens an X display of its own); it shows
+    no window. The legacy session save (WM_COMMAND of X11 programs
+    without session management) is X11 only and is skipped on Wayland.
+  * the appmenu kded module opened an X connection when it loaded, used
+    only when an X11 window registers a menu. It connects then.
+  * kcminit wrote the X resources (xrdb) and the root cursor. On Wayland
+    this waits for Xwayland: Raye's Xwayland-session.d hook runs kcminit
+    for the fonts and style modules when it starts.
+
+Reason: each of these connects to the display from compiled code at
+sign-in; no setting, environment variable or script can keep them off X11
+without also breaking them, as tried on 2026-11-19 (hiding DISPLAY from
+kcminit and masking ksmserver still left kded's appmenu starting Xwayland).
+
+--- a/ksmserver/main.cpp
++++ b/ksmserver/main.cpp
+@@ -33,6 +33,8 @@
+ #include <QCommandLineParser>
+ #include <QFile>
+ 
++#include <optional>
++
+ void IoErrorHandler(IceConn iceConn)
+ {
+     KSMServer::self()->ioError(iceConn);
+@@ -102,9 +104,13 @@
+ 
+     QCoreApplication::setAttribute(Qt::AA_DisableSessionManager);
+ 
+-    // force xcb QPA plugin as ksmserver is very X11 specific
++    // force xcb QPA plugin as ksmserver is very X11 specific. Not on Wayland:
++    // connecting to X there starts Xwayland at every sign-in, and nothing but
++    // the legacy session save needs it. ksmserver shows no window. Not
++    // offscreen either: that one opens an X display of its own.
++    const bool onWayland = qgetenv("XDG_SESSION_TYPE") == QByteArrayLiteral("wayland");
+     const QByteArray origQpaPlatform = qgetenv("QT_QPA_PLATFORM");
+-    qputenv("QT_QPA_PLATFORM", QByteArrayView("xcb"));
++    qputenv("QT_QPA_PLATFORM", onWayland ? QByteArrayView("minimal") : QByteArrayView("xcb"));
+ 
+     QCoreApplication::setQuitLockEnabled(false);
+     auto a = new QGuiApplication(argc, argv);
+@@ -121,7 +127,9 @@
+ 
+     KCrash::initialize();
+ 
+-    fcntl(ConnectionNumber(a->nativeInterface<QNativeInterface::QX11Application>()->display()), F_SETFD, 1);
++    if (auto x11 = a->nativeInterface<QNativeInterface::QX11Application>(); x11 && x11->display()) {
++        fcntl(ConnectionNumber(x11->display()), F_SETFD, 1);
++    }
+ 
+     a->setQuitOnLastWindowClosed(false); // #169486
+ 
+@@ -168,17 +176,19 @@
+         flags |= KSMServer::InitFlag::NoLockScreen;
+     }
+ 
+-    // we use the session_type here as ksmserver is already forced as X above
+     // in wayland, kwin manages the lock screen
+-    if (qgetenv("XDG_SESSION_TYPE") == QByteArrayLiteral("wayland")) {
++    if (onWayland) {
+         flags |= KSMServer::InitFlag::NoLockScreen;
+     }
+ 
+     auto server = new KSMServer(flags);
+ 
+-    // for the KDE-already-running check in startkde
+-    KSelectionOwner kde_running("_KDE_RUNNING", 0);
+-    kde_running.claim(false);
++    // for the KDE-already-running check in startkde (X11 only)
++    std::optional<KSelectionOwner> kde_running;
++    if (KWindowSystem::isPlatformX11()) {
++        kde_running.emplace("_KDE_RUNNING", 0);
++        kde_running->claim(false);
++    }
+ 
+     IceSetIOErrorHandler(IoErrorHandler);
+ 
+@@ -204,7 +214,9 @@
+     KDBusService service(KDBusService::Unique);
+ 
+     int ret = a->exec();
+-    kde_running.release(); // needs to be done before QGuiApplication destruction
++    if (kde_running) {
++        kde_running->release(); // needs to be done before QGuiApplication destruction
++    }
+     delete a;
+     return ret;
+ }
+--- a/ksmserver/logout.cpp
++++ b/ksmserver/logout.cpp
+@@ -45,6 +45,7 @@
+ #include "client.h"
+ #include "global.h"
+ #include "server.h"
++#include <KWindowSystem>
+ #include <KConfig>
+ #include <KConfigGroup>
+ #include <KLocalizedString>
+@@ -111,7 +112,9 @@
+ 
+     saveType = saveSession ? SmSaveBoth : SmSaveGlobal;
+ #ifndef NO_LEGACY_SESSION_MANAGEMENT
+-    performLegacySessionSave();
++    if (KWindowSystem::isPlatformX11()) {
++        performLegacySessionSave();
++    }
+ #endif
+     startProtection();
+ 
+@@ -160,7 +163,9 @@
+     saveType = SmSaveLocal;
+     saveSession = true;
+ #ifndef NO_LEGACY_SESSION_MANAGEMENT
+-    performLegacySessionSave();
++    if (KWindowSystem::isPlatformX11()) {
++        performLegacySessionSave();
++    }
+ #endif
+ 
+     auto aboutToSaveCall = m_kwinInterface->aboutToSaveSession(currentSession());
+--- a/appmenu/appmenu.cpp
++++ b/appmenu/appmenu.cpp
+@@ -92,11 +92,6 @@
+         setupMenuImporter();
+     }
+ 
+-#if HAVE_X11
+-    if (auto interface = qGuiApp->nativeInterface<QNativeInterface::QX11Application>(); !interface || !interface->connection()) {
+-        m_xcbConn = xcb_connect(nullptr, nullptr);
+-    }
+-#endif
+     if (qGuiApp->platformName() == QLatin1String("wayland")) {
+         auto connection = KWayland::Client::ConnectionThread::fromApplication();
+         KWayland::Client::Registry registry;
+@@ -124,6 +119,11 @@
+     auto interface = qGuiApp->nativeInterface<QNativeInterface::QX11Application>();
+     auto *c = interface ? interface->connection() : nullptr;
+     if (!c) {
++        // Only an X11 window registers here, so X runs by now. Connecting
++        // when the module loads would start Xwayland at every sign-in.
++        if (!m_xcbConn) {
++            m_xcbConn = xcb_connect(nullptr, nullptr);
++        }
+         c = m_xcbConn;
+     }
+ 
+--- a/kcms/krdb/krdb.cpp
++++ b/kcms/krdb/krdb.cpp
+@@ -51,6 +51,7 @@
+ #include <KUpdateLaunchEnvironmentJob>
+ 
+ #include "krdb.h"
++#include "xwaylandrunning.h"
+ #if HAVE_X11
+ #include <X11/Xlib.h>
+ #include <private/qtx11extras_p.h>
+@@ -461,17 +462,22 @@
+ 
+     tmpFile.flush();
+ 
++    // on Wayland only once X runs: connecting to it would start Xwayland
++    const bool haveX = xServerUp();
++
+     KProcess proc;
+ #ifndef NDEBUG
+     proc << QStringLiteral("xrdb") << QStringLiteral("-merge") << tmpFile.fileName();
+ #else
+     proc << u"xrdb"_s << u"-quiet"_s << u"-merge"_s << tmpFile.fileName();
+ #endif
+-    proc.execute();
++    if (haveX) {
++        proc.execute();
++    }
+ 
+ #if HAVE_X11
+-    xcb_connection_t *connection = xcb_connect(nullptr, nullptr);
+-    if (!xcb_connection_has_error(connection)) {
++    xcb_connection_t *connection = haveX ? xcb_connect(nullptr, nullptr) : nullptr;
++    if (connection && !xcb_connection_has_error(connection)) {
+         xcb_screen_t *screen = xcb_setup_roots_iterator(xcb_get_setup(connection)).data;
+ 
+         // Needed for applications that don't set their own cursor.
+@@ -488,11 +494,13 @@
+             xcb_free_cursor(connection, cursor);
+             xcb_cursor_context_free(context);
+         }
+-    } else {
++    } else if (connection) {
+         qWarning() << "xcb_connect() failed";
+     }
+ 
+-    xcb_disconnect(connection);
++    if (connection) {
++        xcb_disconnect(connection);
++    }
+ #endif
+ 
+     applyGtkStyles(1);
+--- a/kcms/krdb/CMakeLists.txt
++++ b/kcms/krdb/CMakeLists.txt
+@@ -44,3 +44,8 @@
+     DESTINATION ${CMAKECONFIG_INSTALL_DIR}
+     FILE krdbLibraryTargets.cmake
+ )
++
++# Raye's own test, run by the package build (see startkde/CMakeLists.txt)
++if(BUILD_TESTING OR RAYE_TESTING)
++    add_subdirectory(raye-autotests)
++endif()
+--- a/kcms/fonts/fontinit.cpp
++++ b/kcms/fonts/fontinit.cpp
+@@ -7,6 +7,7 @@
+ */
+ 
+ #include "krdb.h"
++#include "xwaylandrunning.h"
+ #include <KConfig>
+ #include <KConfigGroup>
+ #include <KWindowSystem>
+@@ -21,7 +22,7 @@
+     KConfigGroup fontsCfg(&cfg, u"General"_s);
+ 
+     const int dpi = xftDpi();
+-    if (dpi <= 0) {
++    if (dpi <= 0 || !xServerUp()) {
+         return;
+     }
+ 
+--- a/kcms/krdb/xwaylandrunning.h
++++ b/kcms/krdb/xwaylandrunning.h
+@@ -0,0 +1,47 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QDir>
++#include <QFile>
++#include <QFileInfo>
++
++#include <KWindowSystem>
++
++#include <unistd.h>
++
++/*
++ * Whether this account's Xwayland is running, read from proc. KWin starts it
++ * the first time a program connects to the display, so asking the X server
++ * itself would start it.
++ */
++inline bool xwaylandRunning(const QString &proc = QStringLiteral("/proc"), uint uid = getuid())
++{
++    const auto entries = QDir(proc).entryInfoList(QDir::Dirs | QDir::NoDotAndDotDot);
++    for (const QFileInfo &entry : entries) {
++        bool isPid = false;
++        entry.fileName().toUInt(&isPid);
++        if (!isPid || entry.ownerId() != uid) {
++            continue;
++        }
++        QFile comm(entry.filePath() + QStringLiteral("/comm"));
++        if (comm.open(QIODevice::ReadOnly) && comm.readAll().trimmed() == "Xwayland") {
++            return true;
++        }
++    }
++    return false;
++}
++
++/*
++ * Whether X resources can be written now without starting X for them. On
++ * Wayland they are written again when Xwayland starts (Xwayland-session.d
++ * runs kcminit for these modules).
++ */
++inline bool xServerUp()
++{
++    return !KWindowSystem::isPlatformWayland() || xwaylandRunning();
++}
+--- a/kcms/krdb/raye-autotests/CMakeLists.txt
++++ b/kcms/krdb/raye-autotests/CMakeLists.txt
+@@ -0,0 +1,9 @@
++find_package(Qt6 ${QT_MIN_VERSION} REQUIRED COMPONENTS Test)
++
++add_executable(tst_rayexwaylandrunning tst_rayexwaylandrunning.cpp)
++target_include_directories(tst_rayexwaylandrunning PRIVATE ..)
++target_link_libraries(tst_rayexwaylandrunning PRIVATE Qt6::Test KF6::WindowSystem)
++add_test(NAME rayexwaylandrunning COMMAND tst_rayexwaylandrunning)
++set_tests_properties(rayexwaylandrunning PROPERTIES
++    TIMEOUT 60
++    ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
+--- a/kcms/krdb/raye-autotests/tst_rayexwaylandrunning.cpp
++++ b/kcms/krdb/raye-autotests/tst_rayexwaylandrunning.cpp
+@@ -0,0 +1,67 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "xwaylandrunning.h"
++
++#include <QTemporaryDir>
++#include <QTest>
++
++class TestXwaylandRunning : public QObject
++{
++    Q_OBJECT
++
++private:
++    static void addProcess(const QString &proc, const QString &pid, const QByteArray &comm)
++    {
++        QDir(proc).mkpath(pid);
++        QFile f(proc + QLatin1Char('/') + pid + QStringLiteral("/comm"));
++        QVERIFY(f.open(QIODevice::WriteOnly));
++        f.write(comm + '\n');
++    }
++
++private Q_SLOTS:
++    void noXwayland()
++    {
++        QTemporaryDir proc;
++        addProcess(proc.path(), QStringLiteral("12"), "kwin_wayland");
++        addProcess(proc.path(), QStringLiteral("40"), "plasmashell");
++        QVERIFY(!xwaylandRunning(proc.path(), getuid()));
++    }
++
++    void xwaylandOfThisAccount()
++    {
++        QTemporaryDir proc;
++        addProcess(proc.path(), QStringLiteral("12"), "kwin_wayland");
++        addProcess(proc.path(), QStringLiteral("13"), "Xwayland");
++        QVERIFY(xwaylandRunning(proc.path(), getuid()));
++    }
++
++    void xwaylandOfAnotherAccount()
++    {
++        QTemporaryDir proc;
++        addProcess(proc.path(), QStringLiteral("13"), "Xwayland");
++        QVERIFY(!xwaylandRunning(proc.path(), getuid() + 1));
++    }
++
++    void onlyProcessFolders()
++    {
++        QTemporaryDir proc;
++        addProcess(proc.path(), QStringLiteral("self"), "Xwayland");
++        addProcess(proc.path(), QStringLiteral("12x"), "Xwayland");
++        addProcess(proc.path(), QStringLiteral("14"), "Xwayland-helper");
++        QVERIFY(!xwaylandRunning(proc.path(), getuid()));
++    }
++
++    void xServerIsUpOutsideWayland()
++    {
++        // the test runs on the offscreen platform, which is not Wayland
++        QVERIFY(xServerUp());
++    }
++};
++
++QTEST_GUILESS_MAIN(TestXwaylandRunning)
++
++#include "tst_rayexwaylandrunning.moc"

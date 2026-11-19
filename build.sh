@@ -28,7 +28,7 @@ work=${WORK:-$here/work}
 # at desktop/out.
 out=${OUT:-$here/out}
 jobs=${JOBS:-$(nproc)}
-raye_revision=4
+raye_revision=5
 
 say() { printf '\033[1;35m==>\033[0m %s\n' "$*"; }
 die() { echo "build.sh: $*" >&2; exit 1; }
