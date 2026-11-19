@@ -1,0 +1,210 @@
+Subject: The shell gives freed memory back to the system
+
+plasmashell sets a small trim threshold in main(), which only returns what
+is free at the top of the main heap. The holes left inside it, and inside
+the arenas of the render threads, stay counted as the shell's memory: on
+an idle desktop drawn in software, 30 MB of its 208 MB (measured on
+2026-11-19, a fresh sign-in, three minutes idle).
+
+A small timer now calls malloc_trim(0) once the desktop has settled (60 s
+after start, so after Start has warmed up) and every 10 minutes after
+that, for what popups and menus leave behind. A pass takes about 2.5 ms
+the first time and under 0.5 ms later; pages come back only if used.
+
+Reason: the holes are inside plasmashell's own heap, and only a call from
+inside the process can return them. No glibc tunable does it (the trim
+threshold only shrinks the top of the heap, as the test shows), and a
+preloaded library is out because the shell must not depend on LD_PRELOAD.
+
+--- a/shell/main.cpp
++++ b/shell/main.cpp
+@@ -8,6 +8,7 @@
+ */
+ 
+ #include "debug.h"
++#include "heaptrim.h"
+ #include "shellcorona.h"
+ #include "softwarerendernotifier.h"
+ #ifdef WITH_KUSERFEEDBACKCORE
+@@ -201,5 +202,10 @@
+     corona.init();
+     SoftwareRendererNotifier::notifyIfRelevant();
+ 
++    // once the desktop has settled (Start warms up at 10 s), then every
++    // 10 minutes for what popups and menus leave behind
++    using namespace std::chrono_literals;
++    HeapTrim heapTrim(60s, 10min);
++
+     return app.exec();
+ }
+--- a/shell/raye-autotests/CMakeLists.txt
++++ b/shell/raye-autotests/CMakeLists.txt
+@@ -20,3 +20,10 @@
+ set_tests_properties(rayelookandfeellayout PROPERTIES
+     TIMEOUT 60
+     ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
++
++# heaptrim.h is header-only as well: the test runs the real malloc_trim
++add_executable(tst_rayeheaptrim tst_rayeheaptrim.cpp)
++target_include_directories(tst_rayeheaptrim PRIVATE ..)
++target_link_libraries(tst_rayeheaptrim PRIVATE Qt6::Test)
++add_test(NAME rayeheaptrim COMMAND tst_rayeheaptrim)
++set_tests_properties(rayeheaptrim PROPERTIES TIMEOUT 60)
+--- /dev/null
++++ b/shell/heaptrim.h
+@@ -0,0 +1,60 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#pragma once
++
++#include <QObject>
++#include <QTimer>
++
++#include <chrono>
++
++#if __has_include(<malloc.h>) && defined(__GLIBC__)
++#include <malloc.h>
++#endif
++
++/**
++ * Gives freed heap back to the system now and again.
++ *
++ * The trim threshold set in main() only returns what is free at the top of
++ * the main heap. Holes inside it, and inside the arenas of the render
++ * threads, stay counted as the shell's memory: about 30 MB once the desktop
++ * has settled. malloc_trim(0) hands those pages back; it takes a few
++ * milliseconds and the pages are faulted in again only if they are used.
++ */
++class HeapTrim : public QObject
++{
++public:
++    HeapTrim(std::chrono::milliseconds first, std::chrono::milliseconds every, QObject *parent = nullptr)
++        : QObject(parent)
++    {
++        m_timer.setSingleShot(true);
++        // no precision needed, so the wakeup can be shared. Not VeryCoarseTimer:
++        // it rounds to whole seconds, and an interval under one becomes zero.
++        m_timer.setTimerType(Qt::CoarseTimer);
++        QObject::connect(&m_timer, &QTimer::timeout, this, [this, every] {
++            trimNow();
++            ++m_passes;
++            m_timer.start(every);
++        });
++        m_timer.start(first);
++    }
++
++    int passes() const
++    {
++        return m_passes;
++    }
++
++    static void trimNow()
++    {
++#if __has_include(<malloc.h>) && defined(__GLIBC__)
++        malloc_trim(0);
++#endif
++    }
++
++private:
++    QTimer m_timer;
++    int m_passes = 0;
++};
+--- /dev/null
++++ b/shell/raye-autotests/tst_rayeheaptrim.cpp
+@@ -0,0 +1,92 @@
++/*
++    SPDX-FileCopyrightText: 2026 Raye Linux
++
++    SPDX-License-Identifier: GPL-2.0-or-later
++*/
++
++#include "heaptrim.h"
++
++#include <QFile>
++#include <QTest>
++
++#include <malloc.h>
++#include <unistd.h>
++
++#include <cstring>
++#include <vector>
++
++using namespace std::chrono_literals;
++
++static qint64 anonKiB()
++{
++    QFile status(QStringLiteral("/proc/self/status"));
++    if (!status.open(QIODevice::ReadOnly)) {
++        return -1;
++    }
++    for (const QByteArray &line : status.readAll().split('\n')) {
++        if (line.startsWith("RssAnon:")) {
++            return line.mid(8).trimmed().split(' ').value(0).toLongLong();
++        }
++    }
++    return -1;
++}
++
++class RayeHeapTrimTest : public QObject
++{
++    Q_OBJECT
++
++private Q_SLOTS:
++    void initTestCase()
++    {
++        // what plasmashell's main() sets before anything else
++        mallopt(M_TRIM_THRESHOLD, 5 * sysconf(_SC_PAGESIZE));
++    }
++
++    void runsFirstThenEveryInterval()
++    {
++        HeapTrim trim(50ms, 120ms);
++        QCOMPARE(trim.passes(), 0);
++        QTRY_COMPARE_WITH_TIMEOUT(trim.passes(), 1, 2000);
++        QTRY_VERIFY_WITH_TIMEOUT(trim.passes() >= 3, 3000);
++    }
++
++    void waitsTheIntervalBetweenPasses()
++    {
++        HeapTrim trim(10ms, 300ms);
++        QTRY_COMPARE_WITH_TIMEOUT(trim.passes(), 1, 2000);
++        QTest::qWait(100);
++        QCOMPARE(trim.passes(), 1);
++    }
++
++    void givesBackHolesInTheHeap()
++    {
++        // 64 MB in 16 KB blocks, then free all but one in 64: the heap
++        // cannot shrink from the top, so the trim threshold gives nothing
++        // back and the freed pages stay counted
++        constexpr int count = 4096;
++        constexpr size_t size = 16 * 1024;
++        std::vector<char *> blocks(count);
++        for (auto &b : blocks) {
++            b = static_cast<char *>(malloc(size));
++            std::memset(b, 1, size);
++        }
++        for (int i = 0; i < count; ++i) {
++            if (i % 64 != 63) {
++                free(blocks[i]);
++                blocks[i] = nullptr;
++            }
++        }
++        const qint64 held = anonKiB();
++        HeapTrim::trimNow();
++        const qint64 after = anonKiB();
++        for (char *b : blocks) {
++            free(b);
++        }
++        QVERIFY2(held - after > 32 * 1024,
++                 qPrintable(QStringLiteral("%1 KiB before, %2 KiB after").arg(held).arg(after)));
++    }
++};
++
++QTEST_GUILESS_MAIN(RayeHeapTrimTest)
++
++#include "tst_rayeheaptrim.moc"
